@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openevent-modules-im"
+version = "0.1.0"
+description = "OpenEvent IM protocol SDK and P2P syncer"
+requires-python = ">=3.10"
+dependencies = [
+    "openevent-sdk>=0.3.0",
+    "lark-oapi",
+    "PyYAML",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[project.scripts]
+im-p2p-syncer = "openevent.im_p2p_syncer.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openevent"]

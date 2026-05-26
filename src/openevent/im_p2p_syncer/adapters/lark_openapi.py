@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
 
 from ..ids import stable_lark_openapi_uuid
 from ..models import AdapterHealth, ProviderConfig, ProviderEvent, SendResult, SyncBatch
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class LarkOpenAPIAdapter:
@@ -40,6 +44,7 @@ class LarkOpenAPIAdapter:
         try:
             from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
+            content_json = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
             request = (
                 CreateMessageRequest.builder()
                 .receive_id_type("chat_id")
@@ -47,7 +52,7 @@ class LarkOpenAPIAdapter:
                     CreateMessageRequestBody.builder()
                     .receive_id(session_id)
                     .msg_type(msg_type)
-                    .content(json.dumps(content, ensure_ascii=False, separators=(",", ":")))
+                    .content(content_json)
                     .uuid(stable_lark_openapi_uuid(request_id))
                     .build()
                 )
@@ -55,6 +60,12 @@ class LarkOpenAPIAdapter:
             )
             response = self._client.im.v1.message.create(request)
         except Exception as exc:
+            _LOGGER.exception(
+                "lark_message_create_exception request_id=%s session_id=%s error_code=%s",
+                request_id,
+                session_id,
+                type(exc).__name__,
+            )
             return SendResult(
                 success=False,
                 retryable=True,
@@ -62,6 +73,12 @@ class LarkOpenAPIAdapter:
                 error_message=str(exc),
             )
 
+        _log_lark_response(
+            "lark_message_create_response",
+            response,
+            request_id=request_id,
+            session_id=session_id,
+        )
         if not response.success():
             return SendResult(
                 success=False,
@@ -77,7 +94,76 @@ class LarkOpenAPIAdapter:
                 error_code="MISSING_MESSAGE_ID",
                 error_message=f"{self._config.name} response missing message_id",
             )
+        confirmation_error = self._confirm_created_message(
+            response_data=getattr(response, "data", None),
+            message_id=str(message_id),
+            session_id=session_id,
+            msg_type=msg_type,
+            content=content,
+        )
+        if confirmation_error:
+            return SendResult(
+                success=False,
+                retryable=True,
+                error_code="PROVIDER_SEND_UNCONFIRMED",
+                error_message=f"{self._config.name} send response could not be confirmed: {confirmation_error}",
+            )
         return SendResult(success=True, provider_message_id=str(message_id))
+
+    def _confirm_created_message(
+        self,
+        response_data: Any,
+        message_id: str,
+        session_id: str,
+        msg_type: str,
+        content: dict[str, object],
+    ) -> str | None:
+        if response_data is not None:
+            if _has_lark_message_confirmation_fields(response_data):
+                error = _validate_lark_message(response_data, message_id, session_id, msg_type, content)
+                if error is None:
+                    return None
+                return error
+
+        return self._confirm_created_message_by_get(message_id, session_id, msg_type, content)
+
+    def _confirm_created_message_by_get(
+        self,
+        message_id: str,
+        session_id: str,
+        msg_type: str,
+        content: dict[str, object],
+    ) -> str | None:
+        try:
+            from lark_oapi.api.im.v1 import GetMessageRequest
+
+            request = GetMessageRequest.builder().message_id(message_id).build()
+            response = self._client.im.v1.message.get(request)
+        except Exception as exc:
+            _LOGGER.exception(
+                "lark_message_get_exception message_id=%s session_id=%s error_code=%s",
+                message_id,
+                session_id,
+                type(exc).__name__,
+            )
+            return f"{type(exc).__name__}: {exc}"
+
+        _log_lark_response(
+            "lark_message_get_response",
+            response,
+            message_id=message_id,
+            session_id=session_id,
+        )
+        if not response.success():
+            return f"{getattr(response, 'code', '')}: {getattr(response, 'msg', '')}"
+
+        items = getattr(getattr(response, "data", None), "items", None) or []
+        for item in items:
+            if getattr(item, "message_id", None) == message_id:
+                return _validate_lark_message(item, message_id, session_id, msg_type, content)
+        if len(items) == 1:
+            return _validate_lark_message(items[0], message_id, session_id, msg_type, content)
+        return f"message_id {message_id} not found in get response"
 
     def sync_once(self, session_id: str, cursor: object | None) -> SyncBatch:
         try:
@@ -194,3 +280,110 @@ def _normalize_lark_openapi_sender_type(value: Any) -> str:
     if normalized in {"app", "bot"}:
         return "bot"
     return "user"
+
+
+def _has_lark_message_confirmation_fields(item: Any) -> bool:
+    return all(
+        getattr(item, field, None) is not None
+        for field in ("chat_id", "msg_type", "deleted", "body")
+    )
+
+
+def _validate_lark_message(
+    item: Any,
+    message_id: str,
+    session_id: str,
+    msg_type: str,
+    content: dict[str, object],
+) -> str | None:
+    item_message_id = getattr(item, "message_id", None)
+    if item_message_id != message_id:
+        return f"message_id mismatch: expected {message_id}, got {item_message_id}"
+
+    chat_id = getattr(item, "chat_id", None)
+    if chat_id is None:
+        return "response missing chat_id"
+    if chat_id != session_id:
+        return f"chat_id mismatch: expected {session_id}, got {chat_id}"
+
+    if getattr(item, "deleted", False):
+        return f"message {message_id} is deleted"
+
+    item_msg_type = getattr(item, "msg_type", None)
+    if item_msg_type is None:
+        return "response missing msg_type"
+    if item_msg_type != msg_type:
+        return f"msg_type mismatch: expected {msg_type}, got {item_msg_type}"
+
+    body = getattr(item, "body", None)
+    raw_content = getattr(body, "content", None) if body is not None else None
+    if raw_content is None:
+        return "response missing body.content"
+    parsed_content = _parse_lark_content(raw_content)
+    if parsed_content != content:
+        return "content mismatch"
+    return None
+
+
+def _parse_lark_content(raw_content: Any) -> dict[str, Any]:
+    if isinstance(raw_content, dict):
+        return raw_content
+    if isinstance(raw_content, str):
+        try:
+            value = json.loads(raw_content)
+        except json.JSONDecodeError:
+            return {"content": raw_content}
+        return value if isinstance(value, dict) else {"content": value}
+    return {"content": raw_content}
+
+
+def _log_lark_response(event: str, response: Any, **context: Any) -> None:
+    data = getattr(response, "data", None)
+    items = getattr(data, "items", None)
+    if isinstance(items, list):
+        message_summary: Any = [_summarize_lark_message(item) for item in items[:5]]
+    else:
+        message_summary = _summarize_lark_message(data)
+    _LOGGER.info(
+        "%s context=%s success=%s code=%s msg=%s log_id=%s troubleshooter=%s data=%s",
+        event,
+        context,
+        _safe_response_success(response),
+        getattr(response, "code", None),
+        getattr(response, "msg", None),
+        _safe_response_call(response, "get_log_id"),
+        _safe_response_call(response, "get_troubleshooter"),
+        message_summary,
+    )
+
+
+def _summarize_lark_message(item: Any) -> dict[str, Any] | None:
+    if item is None:
+        return None
+    sender = getattr(item, "sender", None)
+    return {
+        "message_id": getattr(item, "message_id", None),
+        "chat_id": getattr(item, "chat_id", None),
+        "msg_type": getattr(item, "msg_type", None),
+        "create_time": getattr(item, "create_time", None),
+        "update_time": getattr(item, "update_time", None),
+        "deleted": getattr(item, "deleted", None),
+        "updated": getattr(item, "updated", None),
+        "sender_id": getattr(sender, "id", None),
+        "sender_id_type": getattr(sender, "id_type", None),
+        "sender_type": getattr(sender, "sender_type", None),
+    }
+
+
+def _safe_response_call(response: Any, method_name: str) -> Any:
+    method = getattr(response, method_name, None)
+    if not callable(method):
+        return None
+    try:
+        return method()
+    except Exception:
+        return None
+
+
+def _safe_response_success(response: Any) -> Any:
+    return _safe_response_call(response, "success")

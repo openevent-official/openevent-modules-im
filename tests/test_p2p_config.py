@@ -8,6 +8,7 @@ import pytest
 
 from openevent.im_sdk import ParsedMessage
 from openevent.im_p2p_syncer.adapters.base import ProviderAdapter
+from openevent.im_p2p_syncer.adapters.lark_openapi import LarkOpenAPIAdapter
 from openevent.im_p2p_syncer.config import ConfigError
 from openevent.im_p2p_syncer.config import load_config
 from openevent.im_p2p_syncer.config import parse_config
@@ -399,6 +400,143 @@ class RaisingSendAdapter(ProviderAdapter):
 
     def health_check(self):
         return AdapterHealth(ok=True)
+
+
+class FakeLarkResponse:
+    def __init__(self, *, success=True, code=0, msg="ok", data=None):
+        self._success = success
+        self.code = code
+        self.msg = msg
+        self.data = data
+
+    def success(self):
+        return self._success
+
+    def get_log_id(self):
+        return "log-123"
+
+    def get_troubleshooter(self):
+        return "trouble-123"
+
+
+class FakeLarkMessageClient:
+    def __init__(self, *, create_response, get_response=None):
+        self.create_response = create_response
+        self.get_response = get_response
+        self.create_requests = []
+        self.get_requests = []
+
+    def create(self, request):
+        self.create_requests.append(request)
+        return self.create_response
+
+    def get(self, request):
+        self.get_requests.append(request)
+        return self.get_response
+
+
+def _fake_lark_adapter(message_client):
+    adapter = object.__new__(LarkOpenAPIAdapter)
+    adapter._config = load_config("p2p_config.yaml").providers["lark"]
+    adapter._client = SimpleNamespace(
+        im=SimpleNamespace(v1=SimpleNamespace(message=message_client))
+    )
+    return adapter
+
+
+def _fake_lark_message(
+    *,
+    message_id="om_1",
+    chat_id="oc_p2p_10001_bot",
+    msg_type="text",
+    content=None,
+    deleted=False,
+):
+    if content is None:
+        content = {"text": "hello"}
+    return SimpleNamespace(
+        message_id=message_id,
+        chat_id=chat_id,
+        msg_type=msg_type,
+        create_time=123,
+        update_time=124,
+        deleted=deleted,
+        updated=False,
+        sender=SimpleNamespace(id="cli_xxx", id_type="app_id", sender_type="app"),
+        body=SimpleNamespace(content=json.dumps(content, ensure_ascii=False, separators=(",", ":"))),
+    )
+
+
+def test_lark_send_message_logs_create_response(caplog):
+    message_client = FakeLarkMessageClient(
+        create_response=FakeLarkResponse(data=_fake_lark_message())
+    )
+    adapter = _fake_lark_adapter(message_client)
+
+    with caplog.at_level(logging.INFO, logger="openevent.im_p2p_syncer.adapters.lark_openapi"):
+        result = adapter.send_message(
+            session_id="oc_p2p_10001_bot",
+            sender_external_user_id="cli_xxx",
+            msg_type="text",
+            content={"text": "hello"},
+            request_id="req-lark-log",
+        )
+
+    assert result.success
+    assert result.provider_message_id == "om_1"
+    assert message_client.get_requests == []
+    assert "lark_message_create_response" in caplog.text
+    assert "message_id" in caplog.text
+    assert "om_1" in caplog.text
+    assert "chat_id" in caplog.text
+    assert "oc_p2p_10001_bot" in caplog.text
+    assert "log-123" in caplog.text
+
+
+def test_lark_send_message_logs_get_response_when_create_response_is_sparse(caplog):
+    message_client = FakeLarkMessageClient(
+        create_response=FakeLarkResponse(data=SimpleNamespace(message_id="om_1")),
+        get_response=FakeLarkResponse(
+            data=SimpleNamespace(items=[_fake_lark_message(message_id="om_1")])
+        ),
+    )
+    adapter = _fake_lark_adapter(message_client)
+
+    with caplog.at_level(logging.INFO, logger="openevent.im_p2p_syncer.adapters.lark_openapi"):
+        result = adapter.send_message(
+            session_id="oc_p2p_10001_bot",
+            sender_external_user_id="cli_xxx",
+            msg_type="text",
+            content={"text": "hello"},
+            request_id="req-lark-get-log",
+        )
+
+    assert result.success
+    assert len(message_client.get_requests) == 1
+    assert "lark_message_create_response" in caplog.text
+    assert "lark_message_get_response" in caplog.text
+    assert "om_1" in caplog.text
+
+
+def test_lark_send_message_rejects_unconfirmed_success_response():
+    message_client = FakeLarkMessageClient(
+        create_response=FakeLarkResponse(
+            data=_fake_lark_message(chat_id="oc_wrong")
+        )
+    )
+    adapter = _fake_lark_adapter(message_client)
+
+    result = adapter.send_message(
+        session_id="oc_p2p_10001_bot",
+        sender_external_user_id="cli_xxx",
+        msg_type="text",
+        content={"text": "hello"},
+        request_id="req-lark-unconfirmed",
+    )
+
+    assert not result.success
+    assert result.error_code == "PROVIDER_SEND_UNCONFIRMED"
+    assert "chat_id mismatch" in result.error_message
 
 
 def test_bot_principal_can_send_request():

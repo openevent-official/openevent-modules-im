@@ -95,7 +95,7 @@ protocol = "im.v1"
 | `prev_seq` | uint64，条件必填，见各 kind 规则 |
 | `request_id` | string，`send.request` / `send.result` 必填 |
 
-OpenEvent Message 顶层字段承载身份和定向可见性，不放入 payload：
+OpenEvent EventMessage 顶层字段承载身份和定向可见性，不放入 payload：
 
 | kind | OpenEvent `principal` | OpenEvent `recipients` |
 | --- | --- | --- |

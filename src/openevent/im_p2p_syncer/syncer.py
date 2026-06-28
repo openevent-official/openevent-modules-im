@@ -110,6 +110,7 @@ class P2PSyncer:
                 from_seq=from_seq,
                 limit=1000,
                 only_my_recipient=False,
+                channels=self._fetch_channels(),
             )
             for message in response.messages:
                 if message.seq <= scan_end_seq:
@@ -150,6 +151,7 @@ class P2PSyncer:
                     from_seq=next_seq,
                     limit=1000,
                     only_my_recipient=False,
+                    channels=self._fetch_channels(),
                 )
                 if not response.messages:
                     next_seq = int(response.next_seq)
@@ -157,8 +159,8 @@ class P2PSyncer:
                     continue
                 for message in response.messages:
                     self._process_live_message(message)
-                    next_seq = int(message.seq) + 1
-                    self.next_event_seq = next_seq
+                next_seq = int(response.next_seq)
+                self.next_event_seq = next_seq
             except Exception as exc:
                 if self.stopped:
                     break
@@ -166,6 +168,9 @@ class P2PSyncer:
                 time.sleep(self.config.retry.idle_sleep_ms / 1000)
                 continue
             self.processor.tick()
+
+    def _fetch_channels(self) -> tuple[int, ...]:
+        return tuple(self.mapping.channel_ids)
 
     def _process_live_message(self, message: Any) -> None:
         try:

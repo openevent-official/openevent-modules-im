@@ -85,7 +85,7 @@ client.publish_sync_record(
 ) -> UInt64
 
 client.parse_payload(payload: bytes) -> JsonObject
-client.parse_message(message: Message) -> ParsedMessage
+client.parse_message(message: EventMessage) -> ParsedMessage
 
 is_request_timeout(request_event_ms: TimestampMs, now_ms: TimestampMs, timeout_ms: DurationMs) -> bool
 ```
@@ -111,7 +111,7 @@ is_request_timeout(request_event_ms: TimestampMs, now_ms: TimestampMs, timeout_m
 - `publish_send_request(...)` 暴露 OpenEvent `recipients` 参数，由调用方决定；未传或传入 `None` 时按空列表发布；该字段只表达 OpenEvent 定向可见性，不表达 IM 发送目标
 - `publish_send_result(...)` 要求调用方传入对应 `send.request` 发起 principal；SDK 只做列表结构与 `UInt64` 范围归一化
 - `publish_sync_record(...)` 透传调用方传入的 `recipients`，SDK 应做 `UInt64` 范围归一化、去重、排序
-- SDK 使用 OpenEvent Message 顶层 `principal` 表达来源身份，不在 payload 中写入 `source_principal`
+- SDK 使用 OpenEvent EventMessage 顶层 `principal` 表达来源身份，不在 payload 中写入 `source_principal`
 
 ## 4. 错误类型
 

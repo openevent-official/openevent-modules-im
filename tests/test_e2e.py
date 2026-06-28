@@ -187,8 +187,9 @@ def _wait_until(predicate, timeout_s: float = 5.0):
     raise AssertionError("condition not reached before timeout")
 
 
-def _fetch_parsed(im_client, client, principal: int, token: str, from_seq: int = 1):
-    response = client.fetch(principal=principal, token=token, from_seq=from_seq, limit=1000)
+def _fetch_parsed(im_client, client, principal: int, token: str, from_seq: int = 1, channel_id: int | None = None):
+    channels = [channel_id] if channel_id is not None else []
+    response = client.fetch(principal=principal, token=token, from_seq=from_seq, limit=1000, channels=channels)
     parsed = []
     for message in response.messages:
         try:
@@ -300,7 +301,7 @@ def test_p2p_syncer_round_trips_with_mock_im_service(monkeypatch, mock_im_server
             lambda: next(
                 (
                     item
-                    for item in _fetch_parsed(im_client, client, bot_principal, bot_token)
+                    for item in _fetch_parsed(im_client, client, bot_principal, bot_token, channel_id=channel.channel_id)
                     if item.kind == "sync.record" and item.data.get("provider_message_id") == "mock-in-1"
                 ),
                 None,
@@ -325,7 +326,14 @@ def test_p2p_syncer_round_trips_with_mock_im_service(monkeypatch, mock_im_server
             lambda: next(
                 (
                     item
-                    for item in _fetch_parsed(im_client, client, bot_principal, bot_token, from_seq=send_request_seq)
+                    for item in _fetch_parsed(
+                        im_client,
+                        client,
+                        bot_principal,
+                        bot_token,
+                        from_seq=send_request_seq,
+                        channel_id=channel.channel_id,
+                    )
                     if item.kind == "send.result" and item.request_id == "send-1"
                 ),
                 None,
@@ -340,7 +348,14 @@ def test_p2p_syncer_round_trips_with_mock_im_service(monkeypatch, mock_im_server
             lambda: next(
                 (
                     item
-                    for item in _fetch_parsed(im_client, client, user_principal, user_token, from_seq=send_result.seq)
+                    for item in _fetch_parsed(
+                        im_client,
+                        client,
+                        user_principal,
+                        user_token,
+                        from_seq=send_result.seq,
+                        channel_id=channel.channel_id,
+                    )
                     if item.kind == "sync.record"
                     and item.data.get("provider_message_id") == send_result.data["provider_message_id"]
                 ),

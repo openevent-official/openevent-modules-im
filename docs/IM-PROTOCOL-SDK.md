@@ -95,7 +95,7 @@ client.publish_sync_record(
 ) -> UInt64
 
 client.parse_payload(payload: bytes) -> JsonObject
-client.parse_message(message: Message) -> ParsedMessage
+client.parse_message(message: EventMessage) -> ParsedMessage
 
 is_request_timeout(request_event_ms: TimestampMs, now_ms: TimestampMs, timeout_ms: DurationMs) -> bool
 ```

@@ -1,20 +1,20 @@
 version: v1
 
 worker:
-  name: im-sync-p2p-lark
   principal: 90001
   token: tok-syncer-90001
-  request_result_timeout_ms: 60000
   shutdown_timeout_ms: 10000
 
 openevent:
   target: 127.0.0.1:9527
+  rpc_timeout_seconds: 10
 
 retry:
   publish_max_attempts: 5
   publish_initial_backoff_ms: 200
   publish_max_backoff_ms: 5000
   provider_send_max_attempts: 5
+  provider_send_retry_delay_ms: 1000
   idle_sleep_ms: 200
 
 logging:
@@ -28,18 +28,20 @@ principal_tokens:
 
 providers:
   - name: lark
-    enabled: true
-    adapter: lark
     sync:
-      mode: poll
-      interval_ms: 5000
+      history_retry_delay_ms: 1000
+      history_overlap_ms: 300000
+      history_lookback_ms: 300000
       page_size: 50
-      startup_lookback_ms: 300000
+      event_queue_size: 1000
     credentials:
       app_id: cli_xxx
       app_secret: app-secret-xxx
     options:
       api_base_url: https://open.larksuite.com
+      timeout_seconds: 10
+      event_connect_timeout_seconds: 30
+      event_reconnect_timeout_seconds: 300
 
 mappings:
   - provider: lark
@@ -48,11 +50,9 @@ mappings:
     principal: 10001
     session_id: oc_p2p_10001_bot
     channel_id: 10001
-    status: active
   - provider: lark
     identity_type: bot
     external_user_id: cli_xxx
     principal: 90002
     session_id: oc_p2p_10001_bot
     channel_id: 10001
-    status: active

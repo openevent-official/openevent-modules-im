@@ -2,7 +2,7 @@
 
 [中文版](IM-PROTOCOL-SDK_cn.md)
 
-> Version: v0.1
+> Version: v0.4
 > Status: usable
 > Scope: Python callers that publish, parse, and handle `im.v1` protocol
 > messages.
@@ -65,10 +65,7 @@ TimestampMs = int     # Unix epoch milliseconds, value >= 0
 DurationMs = int      # elapsed milliseconds, value >= 0
 JsonObject = dict[str, object]
 
-client = create_client(
-    openevent_client: OpenEventClient,
-    request_result_timeout_ms: DurationMs = 60000,
-) -> ImProtocolClient
+client = create_client(openevent_client: OpenEventClient) -> ImProtocolClient
 
 client.publish_send_request(
     principal: UInt64,
@@ -96,9 +93,14 @@ client.publish_sync_record(
 
 client.parse_payload(payload: bytes) -> JsonObject
 client.parse_message(message: EventMessage) -> ParsedMessage
-
-is_request_timeout(request_event_ms: TimestampMs, now_ms: TimestampMs, timeout_ms: DurationMs) -> bool
 ```
+
+Every publish records the current OpenEvent `max_seq` before calling
+`PublishAutoSeq`. If the response is uncertain, the client fixes a later
+`max_seq` watermark and scans that interval with `Fetch`. A matching message is
+returned as success; a new publish may be attempted only after the scan proves
+that the original call did not commit. Failure to complete reconciliation is
+reported as an unknown outcome and must not be retried directly.
 
 OpenEvent ID fields such as `principal`, `channel_id`, `seq`, and
 `recipients[]` are `uint64`. Python APIs use `int`, but SDKs and callers must
@@ -143,6 +145,12 @@ OpenEvent publish failures are exposed as `PUBLISH_FAILED`. Invalid payloads,
 invalid field types, or unsupported protocol versions use their corresponding
 SDK errors.
 
+`PublishFailedError.retry_safe` is true only when the failed attempt is known not
+to have committed, including a completed reconciliation that found no matching
+message. `PublishFailedError.outcome_unknown` is true when reconciliation could
+not prove either outcome. Callers may retry only when `retry_safe` is true and
+must stop or surface the unknown result when `outcome_unknown` is true.
+
 ## 5. Examples
 
 Publish `send.request`:
@@ -175,18 +183,6 @@ if parsed.kind == "sync.record":
     provider_message_id = parsed.data["provider_message_id"]
 ```
 
-Check business-observed timeout:
-
-```python
-from openevent.im_sdk import is_request_timeout
-
-timed_out = is_request_timeout(
-    request_event_ms=1710000001000,
-    now_ms=1710000062000,
-    timeout_ms=60000,
-)
-```
-
 ## 6. Integration Flow
 
 Business module:
@@ -209,6 +205,9 @@ Sync worker:
 
 ## 7. Versioning
 
-1. SDK versions are bound to protocol versions: `im.v1` -> SDK `v1.x`.
-2. Breaking changes use a new protocol: `im.v2` + SDK `v2.x`.
-3. A single major version only accepts backward-compatible extensions.
+1. The SDK ships in the `openevent-modules-im` package. The current SDK release
+   is `v0.4`, and the package version is `0.4.0`.
+2. SDK release versions and protocol versions evolve independently. SDK `v0.4`
+   currently supports `im.v1`.
+3. Breaking protocol changes require a new protocol version; `im.v1` accepts
+   only backward-compatible extensions.

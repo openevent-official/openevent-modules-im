@@ -7,9 +7,11 @@
 - `im.v1` IM 协议规格
 - Python IM 协议 SDK
 - P2P 单聊同步 Worker
-- Feishu/Lark P2P 单聊接入配置样例
+- Feishu/Lark P2P 单聊长连接事件接收与历史补偿配置样例
 
 本仓库不重新定义 OpenEvent gRPC API；OpenEvent API 以环境中安装的 `openevent-sdk` 及其文档为准。
+
+P2P Worker 的定位是把一个 OpenEvent `im.v1` channel 与一个 IM 平台 P2P 会话作为同一条消息流进行双向同步。IM 会话中实际存在的 user 和 bot/app 消息都会同步为 `sync.record`；channel 中的 `send.request` 则由 Worker 发送到对应 IM 会话。
 
 ## 文档
 
@@ -31,12 +33,15 @@
 - `tests/` 包含基础单元测试。
 
 当前 P2P Worker 聚焦 `session_type="p2p"` 的单聊场景，不支持群聊、频道、群成员管理或 `@` 解析。
+Feishu/Lark 不支持普通用户代发，因此 channel 到平台的发送使用配置的应用/机器人身份；这不影响该应用/机器人在平台产生的真实消息回流为 `sync.record`。
 
 ## 环境要求
 
-本项目要求 Python 3.10 或更高版本，并依赖环境中可安装的 `openevent-sdk>=0.3.0`。
+本项目要求 Python 3.10 或更高版本，并依赖环境中可安装的
+`openevent-sdk>=0.4.0` 和 `lark-oapi==1.6.4`。Lark 依赖固定版本，是因为
+WebSocket 关闭适配依赖该版本的运行行为。
 
-测试使用当前 Python 环境中已经安装好的 `openevent-sdk>=0.3.0` 包，不会从
+测试使用当前 Python 环境中已经安装好的 `openevent-sdk>=0.4.0` 包，不会从
 `openevent-sdk/` 子模块安装 SDK。
 
 ## 运行
@@ -62,10 +67,10 @@ make build
 构建完成后，wheel 位于：
 
 ```text
-dist/openevent_modules_im-0.1.0-py3-none-any.whl
+dist/openevent_modules_im-0.4.0-py3-none-any.whl
 ```
 
-本项目 wheel 包内容为 `openevent.im_sdk` 和 `openevent.im_p2p_syncer`；`openevent-sdk>=0.3.0` 由安装环境按依赖解析提供。
+本项目 wheel 包内容为 `openevent.im_sdk` 和 `openevent.im_p2p_syncer`；`openevent-sdk>=0.4.0` 由安装环境按依赖解析提供。
 
 构建并安装生成的 wheel：
 

@@ -7,6 +7,6 @@ from .models import ProviderConfig
 
 
 def create_adapter(config: ProviderConfig) -> ProviderAdapter:
-    if config.adapter in {"feishu", "lark"}:
+    if config.name in {"feishu", "lark"}:
         return LarkOpenAPIAdapter(config)
-    raise ConfigError(f"unsupported provider adapter: {config.adapter}")
+    raise ConfigError(f"unsupported provider: {config.name}")

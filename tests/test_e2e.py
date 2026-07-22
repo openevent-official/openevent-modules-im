@@ -13,7 +13,7 @@ import pytest
 
 from openevent.im_p2p_syncer import syncer as syncer_module
 from openevent.im_p2p_syncer.config import parse_config
-from openevent.im_p2p_syncer.models import AdapterHealth, ProviderEvent, SendResult, SyncBatch
+from openevent.im_p2p_syncer.models import HistoryPage, ProviderEvent, SendResult
 from openevent.im_p2p_syncer.syncer import P2PSyncer
 from openevent.im_sdk import SendRequestInput, create_client as create_im_client
 from openevent.sdk import AdminClient, OpenEventClient
@@ -37,7 +37,7 @@ class MockIMState:
         with self.lock:
             self.pending_events.append(
                 {
-                    "provider": "mock_im",
+                    "provider": "lark",
                     "session_id": "session-1",
                     "provider_message_id": provider_message_id,
                     "sender_external_user_id": "user-ext",
@@ -63,7 +63,7 @@ class MockIMState:
             text = payload.get("content", {}).get("text", "")
             self.pending_events.append(
                 {
-                    "provider": "mock_im",
+                    "provider": "lark",
                     "session_id": payload["session_id"],
                     "provider_message_id": provider_message_id,
                     "sender_external_user_id": payload["sender_external_user_id"],
@@ -112,21 +112,34 @@ class MockHTTPIMAdapter:
     def __init__(self, config, base_url: str):
         self._config = config
         self._base_url = base_url.rstrip("/")
+        self._events: list[ProviderEvent] = []
 
     def provider_name(self) -> str:
         return self._config.name
 
-    def stop_sync(self) -> None:
+    def start_event_stream(self, session_ids: set[str]) -> None:
+        self._session_ids = session_ids
+
+    def stop_event_stream(self) -> None:
         return None
 
-    def health_check(self) -> AdapterHealth:
-        return AdapterHealth(ok=True)
+    def event_stream_error(self):
+        return None
 
-    def sync_once(self, session_id: str, cursor: object | None) -> SyncBatch:
+    def event_stream_generation(self) -> int:
+        return 0
+
+    def take_event(self) -> ProviderEvent | None:
+        if self._events:
+            return self._events.pop(0)
+        session_id = next(iter(self._session_ids))
         with urllib.request.urlopen(f"{self._base_url}/sync?session_id={urllib.parse.quote(session_id)}") as resp:
             payload = json.loads(resp.read().decode("utf-8"))
-        events = [ProviderEvent(**item) for item in payload["events"]]
-        return SyncBatch(events=events, cursor={"seen": time.time_ns()})
+        self._events.extend(ProviderEvent(**item) for item in payload["events"])
+        return self._events.pop(0) if self._events else None
+
+    def fetch_history_page(self, **kwargs) -> HistoryPage:
+        return HistoryPage(events=[])
 
     def send_message(
         self,
@@ -221,7 +234,7 @@ def test_p2p_syncer_round_trips_with_mock_im_service(monkeypatch, mock_im_server
         description=json.dumps(
             {
                 "version": "v1",
-                "provider": "mock_im",
+                "provider": "lark",
                 "session_id": "session-1",
                 "session_type": "p2p",
                 "updated_at_ms": int(time.time() * 1000),
@@ -235,13 +248,14 @@ def test_p2p_syncer_round_trips_with_mock_im_service(monkeypatch, mock_im_server
     raw_config = {
         "version": "v1",
         "worker": {
-            "name": "mock-im-syncer",
             "principal": worker_principal,
             "token": worker_token,
-            "request_result_timeout_ms": 60000,
             "shutdown_timeout_ms": 1000,
         },
-        "openevent": {"target": os.environ["OPENEVENT_IM_E2E_TARGET"]},
+        "openevent": {
+            "target": os.environ["OPENEVENT_IM_E2E_TARGET"],
+            "rpc_timeout_seconds": 10,
+        },
         "retry": {
             "publish_max_attempts": 2,
             "publish_initial_backoff_ms": 1,
@@ -255,32 +269,34 @@ def test_p2p_syncer_round_trips_with_mock_im_service(monkeypatch, mock_im_server
         ],
         "providers": [
             {
-                "name": "mock_im",
-                "adapter": "mock_http",
-                "enabled": True,
-                "sync": {"mode": "poll", "interval_ms": 20, "page_size": 10, "startup_lookback_ms": 0},
-                "credentials": {"mock": "ok"},
+                "name": "lark",
+                "sync": {
+                    "history_retry_delay_ms": 20,
+                    "history_overlap_ms": 1000,
+                    "history_lookback_ms": 1000,
+                    "page_size": 10,
+                    "event_queue_size": 10,
+                },
+                "credentials": {"app_id": "bot-ext", "app_secret": "mock-secret"},
                 "options": {"base_url": base_url},
             }
         ],
         "mappings": [
             {
-                "provider": "mock_im",
+                "provider": "lark",
                 "identity_type": "user",
                 "external_user_id": "user-ext",
                 "principal": user_principal,
                 "session_id": "session-1",
                 "channel_id": channel.channel_id,
-                "status": "active",
             },
             {
-                "provider": "mock_im",
+                "provider": "lark",
                 "identity_type": "bot",
                 "external_user_id": "bot-ext",
                 "principal": bot_principal,
                 "session_id": "session-1",
                 "channel_id": channel.channel_id,
-                "status": "active",
             },
         ],
     }

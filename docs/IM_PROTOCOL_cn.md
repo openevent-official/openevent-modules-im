@@ -175,7 +175,7 @@ MUST 使用降级形态重新发布。
 - 触发条件：Sync Worker 先尝试发布完整保真 `sync.record`；若 OpenEvent 拒绝写入并
   表明 payload 超过服务端限制，Worker 再构造降级记录并重新发布。
 - 降级记录仍表示一条真实 Provider 消息；它参与正常入站幂等，成功发布后也允许推进
-  Provider 同步游标。
+  具体 Worker 定义的历史补偿确认水位。
 - `data.provider_message_id` string、`data.msg_type` string、`data.content_raw` object 必填；OpenEvent
   顶层 `principal` / `recipients`、`timestamps.event_ms`、`prev_seq` 规则保持不变。
 - `data.content_omitted` bool，必须为 `true`；`data.omit_reason` string，必须为
@@ -191,7 +191,7 @@ MUST 使用降级形态重新发布。
   `data.text`，或只填写不会导致超限的摘要字段，例如 `data.text_preview`。
 - 降级记录不得包含完整 Provider 原始 body、完整附件二进制、完整 base64 内容或完整超长文本。
 - 如果降级后 OpenEvent 仍以 payload 超限拒绝写入，Sync Worker MUST 继续裁剪
-  `metadata` 或摘要字段并重试；仍无法写入时，必须停止推进该 Provider 游标并告警，
+  `metadata` 或摘要字段并重试；仍无法写入时，必须停止推进历史补偿确认水位并告警，
   不得静默丢弃该消息。
 
 ### 4.2 `send.request`

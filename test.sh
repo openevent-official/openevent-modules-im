@@ -30,20 +30,26 @@ import importlib.util
 import sys
 
 if importlib.util.find_spec("openevent.sdk") is None:
-    print("missing Python dependency in the current environment: openevent-sdk>=0.3.0", file=sys.stderr)
+    print("missing Python dependency in the current environment: openevent-sdk>=0.4.0", file=sys.stderr)
     sys.exit(2)
 try:
     version = importlib.metadata.version("openevent-sdk")
 except importlib.metadata.PackageNotFoundError:
-    print("missing Python dependency in the current environment: openevent-sdk>=0.3.0", file=sys.stderr)
+    print("missing Python dependency in the current environment: openevent-sdk>=0.4.0", file=sys.stderr)
     sys.exit(2)
 parts = tuple(int(part) for part in version.split(".")[:3] if part.isdigit())
-if parts < (0, 3, 0):
-    print(f"openevent-sdk>=0.3.0 is required, found {version}", file=sys.stderr)
+if parts < (0, 4, 0):
+    print(f"openevent-sdk>=0.4.0 is required, found {version}", file=sys.stderr)
     sys.exit(2)
 PY
 
-"$PYTHON_BIN" -m pip install -q --upgrade --no-compile --target "$DEPS_DIR" pytest PyYAML
+if ! "$PYTHON_BIN" - <<'PY'
+import pytest
+import yaml
+PY
+then
+  "$PYTHON_BIN" -m pip install -q --upgrade --no-compile --target "$DEPS_DIR" pytest PyYAML
+fi
 export PYTHONPATH="$ROOT_DIR/src:$DEPS_DIR${PYTHONPATH:+:$PYTHONPATH}"
 "$PYTHON_BIN" -m pytest tests "$@"
 

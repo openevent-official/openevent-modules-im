@@ -197,8 +197,8 @@ Degraded record rules:
   it because the payload exceeds the deployment limit, the worker constructs and
   publishes a degraded record.
 - A degraded record still represents a real provider message. It participates in
-  inbound idempotency and can advance the provider sync cursor after successful
-  publication.
+  inbound idempotency and can advance the concrete worker's history-repair
+  watermark after successful publication.
 - `data.provider_message_id`, `data.msg_type`, and `data.content_raw` are
   required. OpenEvent top-level fields, `timestamps.event_ms`, and `prev_seq`
   keep their normal rules.
@@ -218,7 +218,8 @@ Degraded record rules:
   attachment bytes, complete base64 content, or complete overlong text.
 - If the degraded record is still rejected as too large, the worker MUST further
   trim metadata or previews and retry. If it still cannot publish, it must stop
-  advancing the provider cursor and alert; it must not silently drop the message.
+  advancing the history-repair watermark and alert; it must not silently drop
+  the message.
 
 ### 4.2 `send.request`
 

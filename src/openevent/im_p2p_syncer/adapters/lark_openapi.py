@@ -2,29 +2,80 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import time
 from typing import Any
 
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
+
 from ..ids import stable_lark_openapi_uuid
-from ..models import AdapterHealth, ProviderConfig, ProviderEvent, SendResult, SyncBatch
+from ..lark_event_stream import LarkEventStream
+from ..errors import PermanentProviderError, ProviderDataError, TransientProviderError
+from ..models import HistoryPage, ProviderConfig, ProviderEvent, SendResult
 
 
 _LOGGER = logging.getLogger(__name__)
+_LARK_RETRYABLE_CODES = {99991402, 11020, 11021}
 
 
 class LarkOpenAPIAdapter:
     def __init__(self, config: ProviderConfig):
         self._config = config
         self._client = self._build_client(config)
+        self._events: queue.Queue[ProviderEvent] = queue.Queue(
+            maxsize=config.sync.event_queue_size
+        )
+        self._allowed_sessions: set[str] = set()
+        self._event_stream: LarkEventStream | None = None
 
     def provider_name(self) -> str:
         return self._config.name
 
-    def stop_sync(self) -> None:
-        return None
+    def start_event_stream(self, session_ids: set[str]) -> None:
+        if self._event_stream is not None:
+            return
+        self._allowed_sessions = set(session_ids)
+        domain = str(
+            self._config.options.get(
+                "api_base_url",
+                "https://open.feishu.cn" if self._config.name == "feishu" else "https://open.larksuite.com",
+            )
+        )
+        self._event_stream = LarkEventStream(
+            app_id=self._config.credentials["app_id"],
+            app_secret=self._config.credentials["app_secret"],
+            domain=domain,
+            connect_timeout_seconds=float(
+                self._config.options.get("event_connect_timeout_seconds", 30.0)
+            ),
+            reconnect_timeout_seconds=float(
+                self._config.options.get("event_reconnect_timeout_seconds", 300.0)
+            ),
+            on_message=self._handle_message_event,
+        )
+        self._event_stream.start()
 
-    def health_check(self) -> AdapterHealth:
-        return AdapterHealth(ok=True)
+    def stop_event_stream(self) -> None:
+        if self._event_stream is not None:
+            self._event_stream.stop()
+            self._event_stream = None
+
+    def event_stream_error(self) -> BaseException | None:
+        if self._event_stream is None:
+            return None
+        return self._event_stream.error()
+
+    def event_stream_generation(self) -> int:
+        if self._event_stream is None:
+            return 0
+        return self._event_stream.reconnect_generation()
+
+    def take_event(self) -> ProviderEvent | None:
+        try:
+            return self._events.get_nowait()
+        except queue.Empty:
+            return None
 
     def send_message(
         self,
@@ -37,7 +88,6 @@ class LarkOpenAPIAdapter:
         if msg_type != "text":
             return SendResult(
                 success=False,
-                retryable=True,
                 error_code="UNSUPPORTED_MSG_TYPE",
                 error_message=f"unsupported msg_type: {msg_type}",
             )
@@ -68,9 +118,9 @@ class LarkOpenAPIAdapter:
             )
             return SendResult(
                 success=False,
-                retryable=True,
                 error_code=type(exc).__name__,
                 error_message=str(exc),
+                retryable=isinstance(exc, (RequestsConnectionError, RequestsTimeout)),
             )
 
         _log_lark_response(
@@ -82,134 +132,131 @@ class LarkOpenAPIAdapter:
         if not response.success():
             return SendResult(
                 success=False,
-                retryable=True,
                 error_code=str(getattr(response, "code", "")),
                 error_message=str(getattr(response, "msg", "")),
+                retryable=_is_retryable_lark_response(response),
             )
         message_id = getattr(getattr(response, "data", None), "message_id", None)
         if not message_id:
             return SendResult(
                 success=False,
-                retryable=True,
                 error_code="MISSING_MESSAGE_ID",
                 error_message=f"{self._config.name} response missing message_id",
             )
-        confirmation_error = self._confirm_created_message(
-            response_data=getattr(response, "data", None),
-            message_id=str(message_id),
-            session_id=session_id,
-            msg_type=msg_type,
-            content=content,
-        )
-        if confirmation_error:
-            return SendResult(
-                success=False,
-                retryable=True,
-                error_code="PROVIDER_SEND_UNCONFIRMED",
-                error_message=f"{self._config.name} send response could not be confirmed: {confirmation_error}",
-            )
         return SendResult(success=True, provider_message_id=str(message_id))
 
-    def _confirm_created_message(
+    def fetch_history_page(
         self,
-        response_data: Any,
-        message_id: str,
         session_id: str,
-        msg_type: str,
-        content: dict[str, object],
-    ) -> str | None:
-        if response_data is not None:
-            if _has_lark_message_confirmation_fields(response_data):
-                error = _validate_lark_message(response_data, message_id, session_id, msg_type, content)
-                if error is None:
-                    return None
-                return error
-
-        return self._confirm_created_message_by_get(message_id, session_id, msg_type, content)
-
-    def _confirm_created_message_by_get(
-        self,
-        message_id: str,
-        session_id: str,
-        msg_type: str,
-        content: dict[str, object],
-    ) -> str | None:
-        try:
-            from lark_oapi.api.im.v1 import GetMessageRequest
-
-            request = GetMessageRequest.builder().message_id(message_id).build()
-            response = self._client.im.v1.message.get(request)
-        except Exception as exc:
-            _LOGGER.exception(
-                "lark_message_get_exception message_id=%s session_id=%s error_code=%s",
-                message_id,
-                session_id,
-                type(exc).__name__,
-            )
-            return f"{type(exc).__name__}: {exc}"
-
-        _log_lark_response(
-            "lark_message_get_response",
-            response,
-            message_id=message_id,
-            session_id=session_id,
-        )
-        if not response.success():
-            return f"{getattr(response, 'code', '')}: {getattr(response, 'msg', '')}"
-
-        items = getattr(getattr(response, "data", None), "items", None) or []
-        for item in items:
-            if getattr(item, "message_id", None) == message_id:
-                return _validate_lark_message(item, message_id, session_id, msg_type, content)
-        if len(items) == 1:
-            return _validate_lark_message(items[0], message_id, session_id, msg_type, content)
-        return f"message_id {message_id} not found in get response"
-
-    def sync_once(self, session_id: str, cursor: object | None) -> SyncBatch:
+        start_ms: int,
+        end_ms: int,
+        page_token: str | None,
+    ) -> HistoryPage:
         try:
             from lark_oapi.api.im.v1 import ListMessageRequest
         except Exception as exc:
-            return SyncBatch(events=[], cursor={"error": str(exc)})
+            raise RuntimeError("lark-oapi is required for Lark history repair") from exc
 
-        now_ms = int(time.time() * 1000)
-        if isinstance(cursor, dict) and isinstance(cursor.get("event_ms"), int):
-            start_ms = cursor["event_ms"] + 1
-        else:
-            start_ms = max(0, now_ms - self._config.sync.startup_lookback_ms)
-        end_ms = now_ms
-        page_token = None
-        events: list[ProviderEvent] = []
-
-        while True:
-            builder = (
-                ListMessageRequest.builder()
-                .container_id_type("chat")
-                .container_id(session_id)
-                .start_time(start_ms // 1000)
-                .end_time(max(end_ms // 1000, start_ms // 1000 + 1))
-                .sort_type("ByCreateTimeAsc")
-                .page_size(self._config.sync.page_size)
-            )
-            if page_token:
-                builder = builder.page_token(page_token)
+        builder = (
+            ListMessageRequest.builder()
+            .container_id_type("chat")
+            .container_id(session_id)
+            .start_time(start_ms // 1000)
+            .end_time(max((end_ms + 999) // 1000, start_ms // 1000 + 1))
+            .sort_type("ByCreateTimeAsc")
+            .page_size(self._config.sync.page_size)
+        )
+        if page_token:
+            builder = builder.page_token(page_token)
+        try:
             response = self._client.im.v1.message.list(builder.build())
-            if not response.success():
-                raise RuntimeError(f"{self._config.name} list messages failed: {response.code} {response.msg}")
+        except (RequestsConnectionError, RequestsTimeout) as exc:
+            raise TransientProviderError(
+                f"{self._config.name} list messages temporarily failed"
+            ) from exc
+        if not response.success():
+            error = f"{self._config.name} list messages failed: {response.code} {response.msg}"
+            if _is_retryable_lark_response(response):
+                raise TransientProviderError(error)
+            raise PermanentProviderError(error)
 
-            data = getattr(response, "data", None)
-            for item in getattr(data, "items", []) or []:
-                event = self._message_to_event(session_id, item)
-                if event is not None:
-                    events.append(event)
+        data = getattr(response, "data", None)
+        if data is None:
+            raise ProviderDataError(f"{self._config.name} list messages response missing data")
+        events = []
+        for item in getattr(data, "items", []) or []:
+            sender = getattr(item, "sender", None)
+            sender_type = getattr(sender, "sender_type", None)
+            sender_identity_type = _normalize_lark_openapi_sender_type(sender_type)
+            if sender_identity_type is None:
+                raise ProviderDataError(
+                    f"{self._config.name} list messages returned a malformed sender"
+                )
+            if getattr(item, "chat_id", None) != session_id:
+                raise ProviderDataError(
+                    f"{self._config.name} list messages returned an item for another chat"
+                )
+            event = self._message_to_event(session_id, item)
+            if event is None:
+                raise ProviderDataError(
+                    f"{self._config.name} list messages returned a malformed item"
+                )
+            events.append(event)
 
-            if not getattr(data, "has_more", False):
-                break
-            page_token = getattr(data, "page_token", None)
-            if not page_token:
-                break
+        next_page_token = None
+        if getattr(data, "has_more", False):
+            next_page_token = getattr(data, "page_token", None)
+            if not next_page_token:
+                raise ProviderDataError(
+                    f"{self._config.name} list messages returned has_more without page_token"
+                )
+        return HistoryPage(events=events, next_page_token=next_page_token)
 
-        next_cursor = {"event_ms": max([event.event_ms for event in events], default=end_ms)}
-        return SyncBatch(events=events, cursor=next_cursor)
+    def _handle_message_event(self, data: Any) -> None:
+        event_data = getattr(data, "event", None)
+        message = getattr(event_data, "message", None)
+        sender = getattr(event_data, "sender", None)
+        session_id = getattr(message, "chat_id", None)
+        if not session_id:
+            raise ProviderDataError(
+                f"{self._config.name} received a message event without chat_id"
+            )
+        if session_id not in self._allowed_sessions:
+            return
+        provider_event = self._event_message_to_event(str(session_id), message, sender)
+        if provider_event is None:
+            raise ProviderDataError(f"{self._config.name} received a malformed message event")
+        try:
+            self._events.put_nowait(provider_event)
+        except queue.Full as exc:
+            raise RuntimeError(f"{self._config.name} message event queue is full") from exc
+
+    def _event_message_to_event(
+        self,
+        session_id: str,
+        message: Any,
+        sender: Any,
+    ) -> ProviderEvent | None:
+        sender_id = getattr(sender, "sender_id", None)
+        sender_identity_type = _normalize_lark_openapi_sender_type(
+            getattr(sender, "sender_type", None)
+        )
+        if sender_identity_type is None:
+            return None
+        sender_external_user_id = (
+            getattr(sender_id, "open_id", None)
+            if sender_identity_type == "user"
+            else self._config.credentials["app_id"]
+        )
+        return self._build_provider_event(
+            session_id=session_id,
+            message_id=getattr(message, "message_id", None),
+            msg_type=getattr(message, "message_type", None),
+            create_time=getattr(message, "create_time", None),
+            sender_external_user_id=sender_external_user_id,
+            sender_identity_type=sender_identity_type,
+            raw_content=getattr(message, "content", None),
+        )
 
     def _build_client(self, config: ProviderConfig):
         try:
@@ -225,6 +272,7 @@ class LarkOpenAPIAdapter:
         api_base_url = config.options.get("api_base_url")
         if api_base_url:
             builder = builder.domain(api_base_url)
+        builder = builder.timeout(float(config.options.get("timeout_seconds", 10.0)))
         return builder.build()
 
     def _message_to_event(self, session_id: str, item: Any) -> ProviderEvent | None:
@@ -235,18 +283,45 @@ class LarkOpenAPIAdapter:
         sender_external_user_id = getattr(sender, "id", None)
         sender_id_type = getattr(sender, "id_type", None)
         sender_identity_type = _normalize_lark_openapi_sender_type(getattr(sender, "sender_type", None))
-        if not message_id or not msg_type or not create_time or not sender_external_user_id:
+        if sender_identity_type is None:
             return None
-        if sender_identity_type == "user" and sender_id_type and sender_id_type != "open_id":
+        if not message_id or not msg_type or create_time is None or not sender_external_user_id:
             return None
-
-        try:
-            event_ms = int(create_time)
-        except (TypeError, ValueError):
+        expected_id_type = "open_id" if sender_identity_type == "user" else "app_id"
+        if sender_id_type != expected_id_type:
             return None
 
         body = getattr(item, "body", None)
         raw_content = getattr(body, "content", None) if body is not None else None
+        return self._build_provider_event(
+            session_id=session_id,
+            message_id=message_id,
+            msg_type=msg_type,
+            create_time=create_time,
+            sender_external_user_id=sender_external_user_id,
+            sender_identity_type=sender_identity_type,
+            raw_content=raw_content,
+        )
+
+    def _build_provider_event(
+        self,
+        *,
+        session_id: str,
+        message_id: Any,
+        msg_type: Any,
+        create_time: Any,
+        sender_external_user_id: Any,
+        sender_identity_type: str,
+        raw_content: Any,
+    ) -> ProviderEvent | None:
+        if not message_id or not msg_type or create_time is None or not sender_external_user_id:
+            return None
+        try:
+            event_ms = int(create_time)
+        except (TypeError, ValueError):
+            return None
+        if event_ms < 0:
+            return None
         content_raw = self._parse_content_raw(raw_content)
         text = content_raw.get("text") if isinstance(content_raw.get("text"), str) else None
         return ProviderEvent(
@@ -273,68 +348,27 @@ class LarkOpenAPIAdapter:
         return {"content": raw_content}
 
 
-def _normalize_lark_openapi_sender_type(value: Any) -> str:
+def _normalize_lark_openapi_sender_type(value: Any) -> str | None:
     if not isinstance(value, str):
-        return "user"
+        return None
     normalized = value.lower()
     if normalized in {"app", "bot"}:
         return "bot"
-    return "user"
-
-
-def _has_lark_message_confirmation_fields(item: Any) -> bool:
-    return all(
-        getattr(item, field, None) is not None
-        for field in ("chat_id", "msg_type", "deleted", "body")
-    )
-
-
-def _validate_lark_message(
-    item: Any,
-    message_id: str,
-    session_id: str,
-    msg_type: str,
-    content: dict[str, object],
-) -> str | None:
-    item_message_id = getattr(item, "message_id", None)
-    if item_message_id != message_id:
-        return f"message_id mismatch: expected {message_id}, got {item_message_id}"
-
-    chat_id = getattr(item, "chat_id", None)
-    if chat_id is None:
-        return "response missing chat_id"
-    if chat_id != session_id:
-        return f"chat_id mismatch: expected {session_id}, got {chat_id}"
-
-    if getattr(item, "deleted", False):
-        return f"message {message_id} is deleted"
-
-    item_msg_type = getattr(item, "msg_type", None)
-    if item_msg_type is None:
-        return "response missing msg_type"
-    if item_msg_type != msg_type:
-        return f"msg_type mismatch: expected {msg_type}, got {item_msg_type}"
-
-    body = getattr(item, "body", None)
-    raw_content = getattr(body, "content", None) if body is not None else None
-    if raw_content is None:
-        return "response missing body.content"
-    parsed_content = _parse_lark_content(raw_content)
-    if parsed_content != content:
-        return "content mismatch"
+    if normalized == "user":
+        return "user"
     return None
 
 
-def _parse_lark_content(raw_content: Any) -> dict[str, Any]:
-    if isinstance(raw_content, dict):
-        return raw_content
-    if isinstance(raw_content, str):
-        try:
-            value = json.loads(raw_content)
-        except json.JSONDecodeError:
-            return {"content": raw_content}
-        return value if isinstance(value, dict) else {"content": value}
-    return {"content": raw_content}
+def _is_retryable_lark_response(response: Any) -> bool:
+    try:
+        code = int(getattr(response, "code", 0))
+    except (TypeError, ValueError):
+        code = 0
+    if code in _LARK_RETRYABLE_CODES:
+        return True
+    raw = getattr(response, "raw", None)
+    status_code = getattr(raw, "status_code", 0)
+    return status_code == 429 or 500 <= status_code < 600
 
 
 def _log_lark_response(event: str, response: Any, **context: Any) -> None:

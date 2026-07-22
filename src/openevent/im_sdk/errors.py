@@ -13,6 +13,13 @@ class MalformedPayloadError(ImProtocolError):
 class PublishFailedError(RuntimeError):
     """Raised when OpenEvent publishing fails."""
 
-
-class UnsupportedProtocolVersionError(ImProtocolError):
-    """Raised when a channel description uses an unsupported IM protocol version."""
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_safe: bool = False,
+        outcome_unknown: bool = False,
+    ):
+        super().__init__(message)
+        self.retry_safe = retry_safe
+        self.outcome_unknown = outcome_unknown

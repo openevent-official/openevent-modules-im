@@ -2,7 +2,7 @@
 
 [English version](IM-PROTOCOL-SDK.md)
 
-> 版本：v0.1  
+> 版本：v0.4
 > 状态：可用  
 > 适用范围：Python 调用方发布、解析和处理 `im.v1` 协议消息。
 
@@ -55,10 +55,7 @@ TimestampMs = int     # Unix epoch milliseconds, value >= 0
 DurationMs = int      # elapsed milliseconds, value >= 0
 JsonObject = dict[str, object]
 
-client = create_client(
-    openevent_client: OpenEventClient,
-    request_result_timeout_ms: DurationMs = 60000,
-) -> ImProtocolClient
+client = create_client(openevent_client: OpenEventClient) -> ImProtocolClient
 
 client.publish_send_request(
     principal: UInt64,
@@ -86,9 +83,12 @@ client.publish_sync_record(
 
 client.parse_payload(payload: bytes) -> JsonObject
 client.parse_message(message: EventMessage) -> ParsedMessage
-
-is_request_timeout(request_event_ms: TimestampMs, now_ms: TimestampMs, timeout_ms: DurationMs) -> bool
 ```
+
+每次发布都会在调用 `PublishAutoSeq` 前记录 OpenEvent 当前 `max_seq`。如果发布结果不确定，
+客户端会取得后续固定 `max_seq` 水位，并使用 `Fetch` 完整扫描该区间；找到完全匹配的消息时
+按成功返回，只有扫描证明原调用未提交后才允许重新发布。对账无法完成时返回结果未知错误，
+调用方不得直接重试。
 
 说明：OpenEvent 的 `principal`、`channel_id`、`seq`、`recipients[]` 等 ID 字段语义均为
 `uint64`。Python API 使用 `int` 承载这些值，但 SDK 和调用方必须按 `UInt64` 范围处理。
@@ -124,6 +124,11 @@ SDK 公开错误类型：
 
 OpenEvent 发布失败会以 `PUBLISH_FAILED` 暴露给调用方；非法 payload、非法字段类型或不支持的协议版本会以对应错误暴露给调用方。
 
+只有本次调用已经确定未提交，或者对账完成且没有找到匹配消息时，
+`PublishFailedError.retry_safe` 才为 `true`。对账无法证明任何一种结果时，
+`PublishFailedError.outcome_unknown` 为 `true`。调用方只能在 `retry_safe=true` 时重试；
+`outcome_unknown=true` 时必须停止发布或把未知结果暴露给上层。
+
 ## 5. 使用示例
 
 发布 `send.request`：
@@ -156,18 +161,6 @@ if parsed.kind == "sync.record":
     provider_message_id = parsed.data["provider_message_id"]
 ```
 
-判断业务观察超时：
-
-```python
-from openevent.im_sdk import is_request_timeout
-
-timed_out = is_request_timeout(
-    request_event_ms=1710000001000,
-    now_ms=1710000062000,
-    timeout_ms=60000,
-)
-```
-
 ## 6. 集成方式
 
 业务模块：
@@ -186,6 +179,6 @@ Sync Worker：
 
 ## 7. 版本策略
 
-1. SDK 与协议版本绑定：`im.v1` -> SDK `v1.x`
-2. 破坏性变更走新协议：`im.v2` + SDK `v2.x`
-3. 同一主版本内只做向后兼容增强
+1. SDK 随 `openevent-modules-im` 包发布；当前 SDK 版本为 `v0.4`，包版本为 `0.4.0`
+2. SDK 发布版本与协议版本独立演进；SDK `v0.4` 当前支持 `im.v1`
+3. 协议破坏性变更必须使用新协议版本；`im.v1` 内只允许向后兼容增强

@@ -8,10 +8,16 @@ contains:
 - `im.v1` IM protocol specification.
 - Python IM protocol SDK.
 - P2P direct-message sync worker.
-- Feishu/Lark P2P direct-message configuration examples.
+- Feishu/Lark P2P WebSocket event and history-repair configuration examples.
 
 This repository does not redefine the OpenEvent gRPC API. OpenEvent API behavior
 is defined by the installed `openevent-sdk` package and its documentation.
+
+The P2P worker treats one OpenEvent `im.v1` channel and one provider P2P session
+as two representations of the same message stream and synchronizes them in both
+directions. Actual user and bot/app messages in the provider session become
+`sync.record` events, while `send.request` events in the channel are sent to the
+corresponding provider session.
 
 ## Documentation
 
@@ -44,13 +50,18 @@ OpenEvent channels.
 The current P2P worker focuses on `session_type="p2p"` direct-message sessions.
 It does not support group chats, channels, group member management, or mention
 parsing.
+Feishu/Lark cannot send as an ordinary user, so channel-to-provider sends use the
+configured app/bot identity. Actual messages produced by that app/bot still flow
+back into the channel as `sync.record` events.
 
 ## Requirements
 
 Python 3.10 or later is required. The runtime environment must provide
-`openevent-sdk>=0.3.0`.
+`openevent-sdk>=0.4.0` and `lark-oapi==1.6.4`. The Lark dependency is pinned
+because the WebSocket shutdown integration depends on that SDK version's
+runtime behavior.
 
-Tests use the `openevent-sdk>=0.3.0` package already installed in the current
+Tests use the `openevent-sdk>=0.4.0` package already installed in the current
 Python environment. They do not install SDK from the submodule.
 
 ## Run
@@ -79,11 +90,11 @@ make build
 The wheel is written to:
 
 ```text
-dist/openevent_modules_im-0.1.0-py3-none-any.whl
+dist/openevent_modules_im-0.4.0-py3-none-any.whl
 ```
 
 The wheel contains `openevent.im_sdk` and `openevent.im_p2p_syncer`.
-`openevent-sdk>=0.3.0` is resolved by the install environment.
+`openevent-sdk>=0.4.0` is resolved by the install environment.
 
 Build and install:
 

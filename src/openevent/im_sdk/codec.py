@@ -44,10 +44,21 @@ def parse_payload_object(value: Any) -> JsonObject:
 
     if kind == "sync.record":
         require_timestamp_ms(timestamps.get("ingested_ms"), "timestamps.ingested_ms")
+        require_non_empty_str(data.get("provider_message_id"), "data.provider_message_id")
+        require_non_empty_str(data.get("msg_type"), "data.msg_type")
+        require_object(data.get("content_raw"), "data.content_raw")
     if "prev_seq" in payload:
         require_uint64(payload["prev_seq"], "prev_seq")
     if kind in {"send.request", "send.result"}:
         require_non_empty_str(payload.get("request_id"), "request_id")
+    if kind == "send.request":
+        require_non_empty_str(data.get("msg_type"), "data.msg_type")
+        require_object(data.get("content"), "data.content")
+    if kind == "send.result":
+        require_uint64(payload.get("prev_seq"), "prev_seq")
+        status = require_non_empty_str(data.get("status"), "data.status")
+        if status not in {"SUCCESS", "FAILED"}:
+            raise MalformedPayloadError("data.status must be SUCCESS or FAILED")
 
     return payload
 

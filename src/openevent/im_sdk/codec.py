@@ -145,17 +145,3 @@ def encode_sync_record(req: SyncRecordInput) -> bytes:
     if req.prev_seq is not None:
         payload["prev_seq"] = require_uint64(req.prev_seq, "prev_seq")
     return encode_payload(payload)
-
-
-def build_message_too_large_content_raw(
-    *,
-    original_size_bytes: int | None = None,
-    metadata: JsonObject | None = None,
-) -> JsonObject:
-    content_raw: JsonObject = {"omitted": True, "reason": "message_too_large"}
-    if original_size_bytes is not None:
-        if isinstance(original_size_bytes, bool) or original_size_bytes <= 0:
-            raise MalformedPayloadError("original_size_bytes must be greater than 0")
-        content_raw["original_size_bytes"] = original_size_bytes
-    content_raw["metadata"] = require_object(metadata or {}, "metadata")
-    return content_raw

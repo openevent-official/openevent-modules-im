@@ -136,10 +136,11 @@ Constraints:
 - Outbound `send.request` OpenEvent `principal` must resolve to the bot
   mapping in the same channel, proving that the principal is the current bot
   participant.
-- Real-time events and history repair use the same sender rules: user senders map
-  to the user principal, and app/bot senders map to the bot principal. An unknown
-  sender or malformed message fails the worker; it must not be silently skipped
-  or advance a watermark.
+- The provider message puller applies the same sender rules to history and
+  subscription messages: user senders map to the user principal, and app/bot
+  senders map to the bot principal. The processor does not distinguish their
+  source. An unknown sender or malformed message fails the worker and must not
+  be silently skipped or acknowledged.
 - Channels absent from the mapping config must not be processed, even if visible
   to the sync worker principal.
 
@@ -212,59 +213,67 @@ Feishu/Lark constraints:
   are retried. Credential, permission, argument, target-session, and response-shape
   errors produce a final failure immediately.
 
-The real-time path uses `im.message.receive_v1`. Before acknowledging an event,
-the SDK callback validates it and writes it to a bounded queue. A full queue or
-a malformed mapped message makes the callback fail and terminates the worker;
-the process restart runs startup repair. Mapping, idempotency, business state,
-and OpenEvent publication remain single-threaded.
+The provider message puller wraps the `im.message.receive_v1` subscription and
+`message.list` handoff into one acknowledged message stream. The SDK callback
+validates subscription events and writes them to a bounded queue. A full queue
+or malformed mapped message fails the callback and terminates the worker for a
+process-manager restart. Mapping, idempotency, business state, and OpenEvent
+publication remain single-threaded.
 
-`message.list` is used only for startup and post-reconnect handoff repair. A
-stable WebSocket connection does not run periodic history scans. The WebSocket
-connects first and buffers real-time events; the worker then scans every chat
-from its confirmed event time minus `history_overlap_ms`, rotating pages across
-channels. It consumes the buffered events and starts outbound work only after
-all fixed history windows complete. With no history it uses
-`history_lookback_ms` from the startup anchor. On restart, the watermark and
-message-ID dedup set are rebuilt from OpenEvent `sync.record` history.
+Only the message puller uses `message.list`, at initial startup and after a
+WebSocket reconnect. A stable connection does not run periodic history scans.
+The puller first establishes the WebSocket and buffers subscription events,
+then completes a fixed history window for each session starting at its confirmed
+`event_ms` minus `history_overlap_ms`. With no confirmed message it uses
+`history_lookback_ms`. On restart, confirmed event times and the message-ID
+dedup set are rebuilt from OpenEvent `sync.record` history. An explicitly
+temporary history-query failure preserves that session's query window and page
+token and retries after `history_retry_delay_ms`; permanent, malformed, and
+unclassified failures terminate the worker.
 
-During handoff repair the main loop processes only history pages, rotating
-across channels. In the stable state it rotates between outbound requests and
-real-time provider events. It checks event-stream errors and the reconnect
-generation before every turn; a new generation immediately starts another
-handoff repair. OpenEvent `Fetch` retries only `UNAVAILABLE` and
-`DEADLINE_EXCEEDED`; other Fetch errors terminate the worker. History calls
-retry only explicit temporary failures while preserving the same query window
-and page token; permanent, malformed, and unclassified failures terminate the
-worker.
+The puller exposes at most one unacknowledged message per session. It does not
+deliver buffered subscription events for a session until that session's handoff
+window and already delivered history messages are complete, while other
+sessions may continue. The processor sees ordinary provider messages only; it
+has no repair or stable state. History and subscription messages enter the same
+queue and follow the same per-channel serialization. An unfinished
+`send.request` blocks provider messages only in its own channel, while other
+channels continue inbound and outbound work. The processor acknowledges a
+provider message to the puller only after publication succeeds or idempotent
+state proves it was already processed.
+
+OpenEvent `Fetch` retries only `UNAVAILABLE` and `DEADLINE_EXCEEDED`; other
+Fetch errors terminate the worker.
 
 Provider `message_id` is the idempotency and send-result association key.
 `page_token` is scoped to one history query; no timestamp, page token, or
-message ID is treated as a provider sequence. Overlap repair reduces delayed
-visibility loss, but Lark publishes no maximum visibility delay, so it cannot
-guarantee recovery from an arbitrarily delayed message.
+message ID is treated as a provider sequence. Overlapping history queries
+reduce delayed visibility loss, but Lark publishes no maximum visibility delay,
+so they cannot guarantee recovery from an arbitrarily delayed message.
 
 OpenEvent `seq` is the order in which records are durably written, not provider
-event time. History repair can publish an older `timestamps.event_ms` at a larger
-`seq`; consumers must use `timestamps.event_ms` for message business time.
+event time. An older message returned by the history API may be written at a
+larger `seq`; consumers must use `timestamps.event_ms` for message business time.
 
 ## 6. Reliability and Failure Results
 
 | Scenario | Strategy |
 | --- | --- |
 | Inbound provider sender has no P2P mapping | Do not publish; fail the worker and restart it after config repair |
-| Mapped real-time event or history message is malformed | Fail the worker; do not acknowledge, skip, or advance the history watermark |
+| Mapped provider message is malformed | Fail the worker; do not acknowledge or skip the message |
 | Conflicting `send.request` content for one `request_id`, or mismatched `send.result.prev_seq` | Fail the worker; do not restore from partial state or resend the request |
 | Principal token missing | Do not publish; log error and wait for config repair |
 | Channel protocol, description, private visibility, or membership mismatch | Startup failure |
 | Lark WebSocket startup failure or permanent exit | Exit the worker for process-manager restart; never silently degrade to history polling only |
-| Real-time event queue full or callback failure | Fail the callback and terminate the worker; startup repair runs after process restart |
-| Explicit temporary history failure | Preserve the query window and page token; retry after `history_retry_delay_ms` |
-| Permanent, malformed, or unclassified history failure | Exit the worker without advancing the watermark |
+| Real-time event queue full or callback failure | Fail the callback and terminate the worker; the message puller repeats connection handoff after process restart |
+| Explicit temporary history-query failure inside the message puller | Preserve that session's query window and page token and retry after `history_retry_delay_ms`; do not introduce a global repair phase or block other channels |
+| Permanent, malformed, or unclassified history-query failure inside the message puller | Do not acknowledge related messages; exit the worker |
 | `send.request.principal` missing from mapping | Write `send.result(status=FAILED, error_code=MAPPING_MISSING)` and terminate request |
 | Provider send failure | Retry temporary failures at a fixed interval; for non-temporary failures, immediately write `send.result(status=FAILED, error_code=PROVIDER_SEND_FAILED)` and terminate the request |
-| OpenEvent publish is proven not committed | Retry according to `retry.publish_*`; exit after retry limit |
+| OpenEvent publish is proven not committed and the underlying status is `UNAVAILABLE` or `DEADLINE_EXCEEDED` | Retry at the fixed `retry.publish_retry_delay_ms` interval; exit after `retry.publish_max_attempts` |
 | OpenEvent publish outcome remains unknown after reconciliation | Do not republish; exit immediately to avoid a duplicate |
 | OpenEvent rejects full `sync.record` as too large | Rewrite and publish degraded `sync.record` with lightweight metadata and `message_too_large` fields |
+| OpenEvent still rejects the degraded `sync.record` as too large | Do not trim, retry, or acknowledge the provider message; fail the worker |
 
 ## 7. Configuration
 
@@ -287,7 +296,6 @@ worker:
 
 openevent:
   target: 127.0.0.1:9527
-  rpc_timeout_seconds: 10
 
 principal_tokens:
   - principal: 10001
@@ -336,10 +344,8 @@ mappings:
 | `worker.token` | yes | worker OpenEvent token, non-empty string |
 | `worker.shutdown_timeout_ms` | no | maximum graceful shutdown wait after signal, default `10000`; timeout exits unsuccessfully |
 | `openevent.target` | yes | public OpenEvent gRPC endpoint |
-| `openevent.rpc_timeout_seconds` | no | deadline for every OpenEvent unary RPC, default `10`, must be positive |
 | `retry.publish_max_attempts` | no | OpenEvent write retry limit, default `5` |
-| `retry.publish_initial_backoff_ms` | no | initial publish retry backoff, default `200` |
-| `retry.publish_max_backoff_ms` | no | maximum publish retry backoff, default `5000` |
+| `retry.publish_retry_delay_ms` | no | fixed retry delay when a publish is proven not committed and its underlying status is `UNAVAILABLE` or `DEADLINE_EXCEEDED`, default `200`, non-negative |
 | `retry.provider_send_max_attempts` | no | provider send retry limit per request, default `5` |
 | `retry.provider_send_retry_delay_ms` | no | fixed delay between temporary provider send failures, default `1000`, non-negative |
 | `retry.idle_sleep_ms` | no | main-loop idle sleep, default `200` |
@@ -347,9 +353,9 @@ mappings:
 | `principal_tokens[]` | yes | user/bot OpenEvent principal tokens; excludes `worker.principal` |
 | `providers[]` | yes | exactly one provider; every listed provider is enabled |
 | `providers[].name` | yes | provider identity and adapter type; `feishu` or `lark` |
-| `providers[].sync.history_retry_delay_ms` | no | fixed retry delay after an explicitly temporary startup/reconnect repair failure, default `1000`, non-negative; it does not schedule stable-state scans |
-| `providers[].sync.history_overlap_ms` | no | overlap before the confirmed watermark, default `300000`, non-negative |
-| `providers[].sync.history_lookback_ms` | no | first-repair lookback with no history, default `300000`, positive |
+| `providers[].sync.history_retry_delay_ms` | no | fixed retry delay after an explicitly temporary startup/reconnect history query in the message puller, default `1000`, non-negative; it does not schedule stable-connection scans |
+| `providers[].sync.history_overlap_ms` | no | message-puller handoff overlap before the confirmed `event_ms`, default `300000`, non-negative |
+| `providers[].sync.history_lookback_ms` | no | initial message-puller handoff lookback with no confirmed provider message, default `300000`, positive |
 | `providers[].sync.page_size` | no | history page size, default `50`, range `1..50` |
 | `providers[].sync.event_queue_size` | no | bounded real-time event queue size, default `1000`, positive |
 | `providers[].credentials` | yes | Feishu/Lark require non-empty `app_id` and `app_secret` |
@@ -382,6 +388,6 @@ Deployment checklist:
 - Every mapped channel is private and contains the user, bot, and sync worker principals.
 - Every Feishu/Lark bot mapping uses its provider `credentials.app_id` as `external_user_id`.
 - Provider credentials have permissions to read and send direct messages.
-- The app subscribes to `im.message.receive_v1`, and history-read permissions cover repair.
+- The app subscribes to `im.message.receive_v1`, and history-read permissions cover connection handoff.
 - The process manager restarts the worker after a permanent WebSocket failure.
 - Runtime logs and process manager restarts are configured.

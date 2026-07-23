@@ -16,7 +16,6 @@ _GUARANTEED_NOT_COMMITTED = {
     StatusCode.NOT_FOUND,
     StatusCode.INVALID_ARGUMENT,
     StatusCode.RESOURCE_EXHAUSTED,
-    StatusCode.ABORTED,
 }
 
 

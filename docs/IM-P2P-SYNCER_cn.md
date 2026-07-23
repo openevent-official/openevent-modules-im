@@ -109,7 +109,7 @@ mappings:
 - 同一 p2p channel 必须正好能推导出两个不同的参与方 principal，并且身份类型必须是一条 `user`、一条 `bot`
 - Feishu/Lark bot mapping 的 `external_user_id` 必须等于对应 Provider 的 `credentials.app_id`，保证回流的 app/bot sender 能稳定映射到该 bot principal
 - 出站 `send.request` 的 OpenEvent `principal` 必须能在同一 `channel_id` 的 bot mapping 中反查到 Provider `external_user_id`，用于证明该 principal 是当前机器人参与方
-- 实时事件和历史补偿使用相同 sender 规则：user 发送者映射到 user principal，app/bot 发送者映射到 bot principal；无法映射或消息格式非法时，禁止发布并使 Worker 失败退出，不能静默跳过或推进水位
+- Provider 消息拉取器对历史接口和实时订阅使用相同 sender 规则：user 发送者映射到 user principal，app/bot 发送者映射到 bot principal；上层处理器不区分消息来源。无法映射或消息格式非法时，禁止发布并使 Worker 失败退出，不能静默跳过或确认该消息
 - 不在映射配置内的 channel，即使 Sync Worker principal 可见，也不得处理
 
 ## 4. 运行方式
@@ -154,34 +154,37 @@ Feishu/Lark 约束：
 - `message.create` 成功并返回 `message_id` 后直接按成功处理，不再调用 `message.get` 做额外确认
 - 只有明确限流、HTTP 5xx、连接异常和超时会重试；凭据、权限、参数、目标会话和响应字段错误立即写出最终失败结果
 
-实时主链路使用 `im.message.receive_v1`。SDK 回调在确认事件前完成解析并写入有界队列；队列满或映射内消息格式错误时回调抛错，使本次投递返回失败，同时使 Worker 退出并由进程管理器重启。业务状态、映射、幂等和 OpenEvent 发布仍只在 Worker 单线程主循环中修改。
+Provider 消息拉取器把 `im.message.receive_v1` 订阅和 `message.list` 连接交接封装成同一条带确认的消息流。SDK 回调先校验实时事件并写入有界队列；队列满或映射内消息格式错误时回调抛错，使本次投递失败，同时使 Worker 退出并由进程管理器重启。业务状态、映射、幂等和 OpenEvent 发布仍只在 Worker 单线程主循环中修改。
 
-`message.list` 只用于首次启动和 WebSocket 重连后的连接交接补偿，稳定连接期间不做周期扫描。WebSocket 先物理连接并缓冲实时事件；Worker 再从各 channel 已确认 `event_ms` 向前重叠 `history_overlap_ms`，按 channel 轮转并完整翻完对应 chat 的固定历史窗口，所有 channel 完成后才消费实时队列和执行出站。首次没有历史时从启动锚点回看 `history_lookback_ms`。重启时已确认水位和 `message_id` 幂等集合从 OpenEvent 历史 `sync.record` 恢复。只有整个查询窗口完成后才推进进程内水位；明确临时失败保留原窗口和 `page_token`，等待 `history_retry_delay_ms` 后重试。
+`message.list` 只由消息拉取器在首次启动和 WebSocket 重连后使用，稳定连接期间不做周期扫描。拉取器先建立 WebSocket 并缓冲实时事件，再按 session 从已确认 `event_ms` 向前重叠 `history_overlap_ms` 拉完固定历史窗口；没有已确认消息时回看 `history_lookback_ms`。重启时已确认 `event_ms` 和 `message_id` 幂等集合从 OpenEvent 历史 `sync.record` 恢复。明确临时的历史查询失败保留原查询窗口和 `page_token`，等待 `history_retry_delay_ms` 后重试；永久错误、坏数据和未分类异常使 Worker 退出。
 
-补偿态只处理历史页，多 channel 按页轮转；补偿完成后，稳定态在出站请求和实时 Provider 事件之间轮转，每轮最多处理一项。每轮开始前都先检查长连接错误和 generation；发现重连后的新 generation 立即重新进入补偿态。OpenEvent `Fetch` 只对 `UNAVAILABLE` 和 `DEADLINE_EXCEEDED` 重试，其他错误使 Worker 退出。历史 RPC 只重试明确临时错误，并保留原查询窗口和 `page_token`；永久错误、坏数据和未分类异常都使 Worker 退出。
+拉取器对每个 session 最多向上层交付一条未确认消息。同一 session 的交接窗口和已交付历史消息完成前，不交付该 session 缓冲的实时消息；其他 session 可以继续拉取和交付。上层处理器收到的都是普通 Provider 消息，不存在补偿态或稳定态：历史消息与订阅消息进入同一队列，统一执行同 channel 串行规则。未完成的 `send.request` 只阻塞所在 channel 的 Provider 消息，其他 channel 的入站和出站继续推进。Provider 消息成功发布或按幂等状态确认已处理后，处理器才向拉取器确认该消息。
 
-Provider `message_id` 是入站幂等键和发送结果关联键。`page_token` 只用于同一历史查询窗口的分页；时间戳、`page_token` 和 `message_id` 都不作为 Provider 提供的持久 sequence。重叠补偿降低延迟可见导致的漏消息风险，但由于 Lark 未声明最大可见延迟，不能提供无限延迟下的绝对不漏保证。
+OpenEvent `Fetch` 只对 `UNAVAILABLE` 和 `DEADLINE_EXCEEDED` 重试，其他错误使 Worker 退出。
 
-OpenEvent `seq` 表示记录持久写入的顺序，不表示 IM 消息业务时间。历史补偿可能把更早的 `timestamps.event_ms` 写在更大的 `seq` 上；消费者必须用 `timestamps.event_ms` 理解消息业务时间。
+Provider `message_id` 是入站幂等键和发送结果关联键。`page_token` 只用于同一历史查询窗口的分页；时间戳、`page_token` 和 `message_id` 都不作为 Provider 提供的持久 sequence。重叠历史查询降低延迟可见导致的漏消息风险，但由于 Lark 未声明最大可见延迟，不能提供无限延迟下的绝对不漏保证。
+
+OpenEvent `seq` 表示记录持久写入的顺序，不表示 IM 消息业务时间。历史接口返回的较早消息可能以更大的 `seq` 写入；消费者必须用 `timestamps.event_ms` 理解消息业务时间。
 
 ## 6. 可靠性与失败结果
 
 | 场景 | 策略 |
 | --- | --- |
 | 入站 Provider sender 无 P2P mapping | 禁止发布并使 Worker 失败退出，等待配置修复后由进程管理器重启 |
-| 映射内实时事件或历史消息格式非法 | Worker 失败退出，不确认、跳过消息或推进历史水位 |
+| 映射内 Provider 消息格式非法 | Worker 失败退出，不确认或跳过消息 |
 | 同一 `request_id` 的 `send.request` 内容冲突，或 `send.result.prev_seq` 不匹配 | Worker 失败退出，禁止按不完整状态恢复并重复发送 |
 | principal token 缺失 | 禁止发布，记录错误，等待配置修复 |
 | channel protocol、description、private visibility 或成员不匹配 | 启动失败 |
 | Lark 长连接启动失败或永久退出 | Worker 失败退出，由进程管理器重启；不静默退化为纯历史轮询 |
-| 实时事件队列满或回调失败 | 回调抛错，本次事件确认失败；Worker 退出并在重启时执行启动补偿 |
-| 明确临时的历史补偿失败 | 保留查询窗口和 `page_token`，等待 `history_retry_delay_ms` 后重试 |
-| 永久、坏数据或未分类的历史补偿失败 | 不推进水位，Worker 退出 |
+| 实时事件队列满或回调失败 | 回调抛错，本次事件确认失败；Worker 退出，重启后的消息拉取器重新执行连接交接 |
+| 消息拉取器内部发生明确临时的历史查询失败 | 保留该 session 的查询窗口和 `page_token`，等待 `history_retry_delay_ms` 后重试；不引入全局恢复阶段，也不阻塞其他 channel |
+| 消息拉取器内部发生永久、坏数据或未分类的历史查询失败 | 不确认相关消息，Worker 退出 |
 | `send.request.principal` 不在 mapping 内 | 写出 `send.result(status=FAILED, error_code=MAPPING_MISSING)` 并结束该 request |
 | Provider 发送失败 | 临时错误按固定间隔有限重试；非临时错误立即写出 `send.result(status=FAILED, error_code=PROVIDER_SEND_FAILED)` 并结束该 request |
-| OpenEvent 发布已确认未提交 | 按 `retry.publish_*` 重试，超过上限后退出进程 |
+| OpenEvent 发布已确认未提交，且底层状态为 `UNAVAILABLE` 或 `DEADLINE_EXCEEDED` | 按 `retry.publish_retry_delay_ms` 固定间隔有限重试，超过 `retry.publish_max_attempts` 后退出进程 |
 | OpenEvent 发布结果不确定且对账失败 | 不再发布，立即退出，避免产生重复消息 |
 | OpenEvent 因 payload 超限拒绝完整 `sync.record` | 改写并发布超大消息降级 `sync.record`，只记录 `provider_message_id`、消息类型、时间、发送者等轻量 meta，并按 [`IM_PROTOCOL_cn.md`](IM_PROTOCOL_cn.md) 写入 `message_too_large` 降级字段 |
+| OpenEvent 仍因 payload 超限拒绝降级 `sync.record` | 不再裁剪或重试，不确认该 Provider 消息，Worker 失败退出 |
 
 ## 7. 配置
 
@@ -203,7 +206,6 @@ worker:
 
 openevent:
   target: 127.0.0.1:9527
-  rpc_timeout_seconds: 10
 
 principal_tokens:
   - principal: 10001
@@ -252,10 +254,8 @@ mappings:
 | `worker.token` | 是 | string，Sync Worker 自身 OpenEvent token，必须非空 |
 | `worker.shutdown_timeout_ms` | 否 | integer，收到退出信号后的最大优雅关闭等待时间，默认 `10000`，必须大于等于 0；超时以失败状态退出 |
 | `openevent.target` | 是 | string，OpenEvent 公共 gRPC endpoint，必须非空 |
-| `openevent.rpc_timeout_seconds` | 否 | number，每个 OpenEvent unary RPC 的 deadline，默认 `10`，必须大于 0 |
 | `retry.publish_max_attempts` | 否 | integer，OpenEvent 写入失败最大尝试次数，默认 `5`，必须大于 0 |
-| `retry.publish_initial_backoff_ms` | 否 | integer，OpenEvent 写入失败初始退避毫秒数，默认 `200`，必须大于等于 0 |
-| `retry.publish_max_backoff_ms` | 否 | integer，OpenEvent 写入失败最大退避毫秒数，默认 `5000`，必须大于等于 0 |
+| `retry.publish_retry_delay_ms` | 否 | integer，明确未提交且底层状态为 `UNAVAILABLE` 或 `DEADLINE_EXCEEDED` 时的固定重试间隔，默认 `200`，必须大于等于 0 |
 | `retry.provider_send_max_attempts` | 否 | integer，单条 `send.request` Provider 发送失败最大尝试次数，默认 `5`，必须大于 0 |
 | `retry.provider_send_retry_delay_ms` | 否 | integer，Provider 临时失败的固定重试间隔，默认 `1000`，必须大于等于 0 |
 | `retry.idle_sleep_ms` | 否 | integer，主循环空闲休眠，默认 `200`，必须大于等于 0 |
@@ -263,9 +263,9 @@ mappings:
 | `principal_tokens[]` | 是 | array，用户 OpenEvent principal token 数组；`principal` 为 uint64 且唯一，`token` 为非空 string，且不得包含 `worker.principal` |
 | `providers[]` | 是 | array，必须正好一个 Provider；列出的 Provider 全部生效 |
 | `providers[].name` | 是 | string，同时作为 Provider 标识和 Adapter 类型，只能是 `feishu` 或 `lark` |
-| `providers[].sync.history_retry_delay_ms` | 否 | integer，启动或重连补偿发生明确临时失败后的固定重试间隔，默认 `1000`，必须大于等于 0；稳定连接不会按此字段周期扫描 |
-| `providers[].sync.history_overlap_ms` | 否 | integer，每次历史补偿向已确认水位之前重叠的窗口，默认 `300000`，必须大于等于 0 |
-| `providers[].sync.history_lookback_ms` | 否 | integer，无 OpenEvent 历史时首次补偿回看窗口，默认 `300000`，必须大于 0 |
+| `providers[].sync.history_retry_delay_ms` | 否 | integer，消息拉取器的启动/重连历史查询发生明确临时失败后的固定重试间隔，默认 `1000`，必须大于等于 0；稳定连接不会按此字段周期扫描 |
+| `providers[].sync.history_overlap_ms` | 否 | integer，消息拉取器每次连接交接向已确认 `event_ms` 之前重叠的窗口，默认 `300000`，必须大于等于 0 |
+| `providers[].sync.history_lookback_ms` | 否 | integer，无已确认 Provider 消息时，消息拉取器首次连接交接的回看窗口，默认 `300000`，必须大于 0 |
 | `providers[].sync.page_size` | 否 | integer，历史接口分页大小，默认 `50`，取值 `1..50` |
 | `providers[].sync.event_queue_size` | 否 | integer，实时事件有界队列容量，默认 `1000`，必须大于 0 |
 | `providers[].credentials` | 是 | object，Feishu/Lark provider 必须包含非空 string `app_id` 与 `app_secret` |
@@ -305,5 +305,5 @@ mappings:
 10. Feishu/Lark bot mapping 的 `external_user_id` 等于对应 Provider 的 `credentials.app_id`
 11. mapping 引用的参与方 principal 都存在 token
 12. Sync Worker principal 可读写 channel
-13. Lark 应用已订阅 `im.message.receive_v1`，且历史消息读取权限满足补偿范围
+13. Lark 应用已订阅 `im.message.receive_v1`，且历史消息读取权限满足连接交接范围
 14. 进程管理器会在长连接永久失败导致 Worker 退出后重启进程

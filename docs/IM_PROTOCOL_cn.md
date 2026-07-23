@@ -174,25 +174,23 @@ MUST 使用降级形态重新发布。
 
 - 触发条件：Sync Worker 先尝试发布完整保真 `sync.record`；若 OpenEvent 拒绝写入并
   表明 payload 超过服务端限制，Worker 再构造降级记录并重新发布。
-- 降级记录仍表示一条真实 Provider 消息；它参与正常入站幂等，成功发布后也允许推进
-  具体 Worker 定义的历史补偿确认水位。
+- 降级记录仍表示一条真实 Provider 消息；它参与正常入站幂等，成功发布后允许 Worker
+  确认该 Provider 消息已经处理。
 - `data.provider_message_id` string、`data.msg_type` string、`data.content_raw` object 必填；OpenEvent
   顶层 `principal` / `recipients`、`timestamps.event_ms`、`prev_seq` 规则保持不变。
 - `data.content_omitted` bool，必须为 `true`；`data.omit_reason` string，必须为
   `message_too_large`。
 - `data.content_raw.omitted` bool，必须为 `true`；`data.content_raw.reason` string，必须为
   `message_too_large`。
-- `data.content_raw.original_size_bytes` integer，若 Provider 能提供或 Worker 能计算则
-  MUST 填写大于 0 的整数；无法获得时可以省略。
+- `data.content_raw.original_size_bytes` integer，可选；填写时必须大于 0。
 - `data.content_raw.metadata` object，MUST 只保存不超限的轻量元信息，例如
   Provider 会话 ID、发送者 ID、消息类型、文件名、MIME 类型、Provider 可见的内容长度、
   文件 key 或 URL 引用；不得包含导致 payload 再次超限的大字段。
 - 对文本类消息，若文本内容本身导致超限，`data.text` 不得填写完整文本；可以省略
   `data.text`，或只填写不会导致超限的摘要字段，例如 `data.text_preview`。
 - 降级记录不得包含完整 Provider 原始 body、完整附件二进制、完整 base64 内容或完整超长文本。
-- 如果降级后 OpenEvent 仍以 payload 超限拒绝写入，Sync Worker MUST 继续裁剪
-  `metadata` 或摘要字段并重试；仍无法写入时，必须停止推进历史补偿确认水位并告警，
-  不得静默丢弃该消息。
+- 如果降级记录仍被 OpenEvent 以 payload 超限拒绝，Sync Worker MUST 停止处理并暴露错误，
+  不得继续裁剪或重试，不得确认该 Provider 消息，也不得静默丢弃。
 
 ### 4.2 `send.request`
 
@@ -267,9 +265,9 @@ Worker 才能继续推进该 channel 的后续同步状态。
 
 Worker 重启或恢复后，仍然必须继续处理尚未进入终态的 `send.request`。业务方不需要、也不应为同一业务动作补写新的 `send.request`。
 
-若超过 `REQUEST_RESULT_TIMEOUT_MS` 仍未观察到 `send.result`，业务模块只能判定该发送仍在
-IM Sync Worker 内等待重试或阻塞，不应提交同一业务动作的新 `send.request`。发送重试和失败终止由
-具体 IM Sync Worker 负责；当前协议没有定义人工取消或死信 kind。
+尚未观察到 `send.result` 时，业务模块只能判定该发送仍在 IM Sync Worker 内等待重试或阻塞，
+不应提交同一业务动作的新 `send.request`。发送重试和失败终止由具体 IM Sync Worker 负责；
+当前协议没有定义人工取消或死信 kind。
 
 ## 6. 版本策略
 

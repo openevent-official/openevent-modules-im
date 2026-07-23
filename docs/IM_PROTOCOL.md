@@ -197,8 +197,8 @@ Degraded record rules:
   it because the payload exceeds the deployment limit, the worker constructs and
   publishes a degraded record.
 - A degraded record still represents a real provider message. It participates in
-  inbound idempotency and can advance the concrete worker's history-repair
-  watermark after successful publication.
+  inbound idempotency and allows the worker to acknowledge that provider message
+  after successful publication.
 - `data.provider_message_id`, `data.msg_type`, and `data.content_raw` are
   required. OpenEvent top-level fields, `timestamps.event_ms`, and `prev_seq`
   keep their normal rules.
@@ -206,8 +206,8 @@ Degraded record rules:
   `message_too_large`.
 - `data.content_raw.omitted` must be `true`; `data.content_raw.reason` must be
   `message_too_large`.
-- `data.content_raw.original_size_bytes` SHOULD be a positive integer when the
-  provider or worker can determine it.
+- `data.content_raw.original_size_bytes` is optional. If present, it must be a
+  positive integer.
 - `data.content_raw.metadata` MUST contain only lightweight metadata that will
   not exceed the payload limit again, such as provider session ID, sender ID,
   message type, filename, MIME type, provider-visible size, file key, or URL.
@@ -216,10 +216,9 @@ Degraded record rules:
   such as `data.text_preview`.
 - Degraded records MUST NOT include the complete provider raw body, complete
   attachment bytes, complete base64 content, or complete overlong text.
-- If the degraded record is still rejected as too large, the worker MUST further
-  trim metadata or previews and retry. If it still cannot publish, it must stop
-  advancing the history-repair watermark and alert; it must not silently drop
-  the message.
+- If the degraded record is still rejected as too large, the worker MUST stop
+  processing and surface the error. It must not trim or retry again, acknowledge
+  the provider message, or silently drop it.
 
 ### 4.2 `send.request`
 
@@ -303,12 +302,11 @@ After restart or recovery, the worker MUST continue unfinished `send.request`
 messages. Business callers do not need to, and should not, write another
 `send.request` for the same business action.
 
-If no `send.result` is observed after `REQUEST_RESULT_TIMEOUT_MS`, business
-modules may only conclude that the send is still pending, retrying, or blocked
-inside the IM sync worker. They should not submit a new `send.request` for the
-same business action. Retry and failure termination are owned by the concrete IM
-sync worker. The current protocol does not define manual cancellation or
-dead-letter kinds.
+Until a `send.result` is observed, business modules may only conclude that the
+send is still pending, retrying, or blocked inside the IM sync worker. They
+should not submit a new `send.request` for the same business action. Retry and
+failure termination are owned by the concrete IM sync worker. The current
+protocol does not define manual cancellation or dead-letter kinds.
 
 ## 6. Versioning
 

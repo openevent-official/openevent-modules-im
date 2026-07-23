@@ -7,12 +7,10 @@ worker:
 
 openevent:
   target: 127.0.0.1:9527
-  rpc_timeout_seconds: 10
 
 retry:
   publish_max_attempts: 5
-  publish_initial_backoff_ms: 200
-  publish_max_backoff_ms: 5000
+  publish_retry_delay_ms: 200
   provider_send_max_attempts: 5
   provider_send_retry_delay_ms: 1000
   idle_sleep_ms: 200

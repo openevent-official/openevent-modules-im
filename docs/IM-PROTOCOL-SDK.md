@@ -19,7 +19,6 @@ The SDK is responsible for:
 - Wrapping standard publish entry points based on an installed `openevent-sdk`.
 - Standardizing protocol writes to reduce duplicate payload construction in
   business modules and sync workers.
-- Providing a timeout helper for `send.request -> send.result`.
 
 The SDK is not responsible for:
 
@@ -62,7 +61,6 @@ Current stable Python SDK API:
 ```python
 UInt64 = int          # 0 <= value <= 2**64 - 1
 TimestampMs = int     # Unix epoch milliseconds, value >= 0
-DurationMs = int      # elapsed milliseconds, value >= 0
 JsonObject = dict[str, object]
 
 client = create_client(openevent_client: OpenEventClient) -> ImProtocolClient
@@ -136,14 +134,15 @@ API notes:
 
 Public SDK error types:
 
-- `INVALID_KIND`
-- `MALFORMED_PAYLOAD`
-- `PUBLISH_FAILED`
-- `UNSUPPORTED_PROTOCOL_VERSION`
+- `ImProtocolError`
+- `InvalidKindError`
+- `MalformedPayloadError`
+- `PublishFailedError`
 
-OpenEvent publish failures are exposed as `PUBLISH_FAILED`. Invalid payloads,
-invalid field types, or unsupported protocol versions use their corresponding
-SDK errors.
+`ImProtocolError` is the base class for invalid protocol inputs.
+`InvalidKindError` reports invalid kinds, `MalformedPayloadError` reports
+malformed payloads or fields, and `PublishFailedError` reports OpenEvent publish
+failures.
 
 `PublishFailedError.retry_safe` is true only when the failed attempt is known not
 to have committed, including a completed reconciliation that found no matching

@@ -14,7 +14,6 @@ from openevent.im_sdk import (
     SyncRecordInput,
     create_client,
 )
-from openevent.im_sdk.codec import build_message_too_large_content_raw
 
 
 class FakeOpenEventClient:
@@ -345,17 +344,3 @@ def test_parse_payload_validates_kind_required_fields(payload, error):
 
     with pytest.raises(MalformedPayloadError, match=error):
         client.parse_payload(json.dumps(payload).encode("utf-8"))
-
-
-def test_message_too_large_content_raw_helper():
-    content_raw = build_message_too_large_content_raw(
-        original_size_bytes=20971520,
-        metadata={"provider_message_id": "msg-1"},
-    )
-
-    assert content_raw == {
-        "omitted": True,
-        "reason": "message_too_large",
-        "original_size_bytes": 20971520,
-        "metadata": {"provider_message_id": "msg-1"},
-    }

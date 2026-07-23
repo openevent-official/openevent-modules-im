@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import time
 from typing import Any
 
 from grpc import RpcError, StatusCode
@@ -17,6 +16,7 @@ from .errors import StateConflictError
 from .loop import FatalSyncerError, SingleThreadProcessor, SyncerStopped
 from .mapping import P2PMappingIndex
 from .models import SyncerConfig
+from .provider_messages import ProviderMessagePuller
 from .state import RuntimeState
 
 
@@ -38,10 +38,19 @@ class P2PSyncer:
         self._stop_lock = threading.Lock()
         self._stopped = False
         self.logger = logging.getLogger("openevent.im_p2p_syncer")
+        self.message_pullers = {
+            name: ProviderMessagePuller(
+                adapter=self.adapters[name],
+                config=provider.sync,
+                logger=self.logger,
+            )
+            for name, provider in config.providers.items()
+        }
         self.processor = SingleThreadProcessor(
             im_client=self.im_client,
             mapping=self.mapping,
             adapters=self.adapters,
+            message_pullers=self.message_pullers,
             retry=config.retry,
             worker_principal=config.worker.principal,
             worker_token=config.worker.token,
@@ -53,11 +62,8 @@ class P2PSyncer:
     def start(self) -> None:
         try:
             self._validate_channels()
-            history_anchor_ms = int(time.time() * 1000)
-            self._start_event_streams()
             scan_end_seq = self._scan_history()
-            self.processor.initialize_history_repair(history_anchor_ms)
-            self._complete_initial_history_repair()
+            self._start_message_pullers()
             self._poll_events(scan_end_seq + 1)
         except SyncerStopped:
             if not self._stop_event.is_set():
@@ -72,18 +78,18 @@ class P2PSyncer:
                 return
             self._stopped = True
             self._stop_event.set()
-            for adapter in self.adapters.values():
-                adapter.stop_event_stream()
+            for puller in self.message_pullers.values():
+                puller.stop()
 
-    def _start_event_streams(self) -> None:
-        for provider, adapter in self.adapters.items():
-            session_ids = {
-                session_id
+    def _start_message_pullers(self) -> None:
+        for provider, puller in self.message_pullers.items():
+            session_highwater_ms = {
+                session_id: self.state.latest_event_ms(channel_id)
                 for channel_id in self.mapping.channel_ids
                 for mapped_provider, session_id in [self.mapping.provider_session(channel_id)]
                 if mapped_provider == provider
             }
-            adapter.start_event_stream(session_ids)
+            puller.start(session_highwater_ms)
 
     def _validate_channels(self) -> None:
         for channel_id in self.mapping.channel_ids:
@@ -109,13 +115,6 @@ class P2PSyncer:
             if description.get("session_type") != "p2p":
                 raise ConfigError(f"channel {channel_id} description.session_type must be p2p")
             self._validate_channel_members(channel_id, channel)
-
-    def _complete_initial_history_repair(self) -> None:
-        while self.processor.history_repair_pending():
-            if self._stop_event.is_set():
-                raise SyncerStopped("syncer stopped during provider history repair")
-            if not self.processor.tick():
-                self._stop_event.wait(self.config.retry.idle_sleep_ms / 1000)
 
     def _validate_channel_members(self, channel_id: int, channel: Any) -> None:
         if channel.visibility != openevent_pb2.VISIBILITY_PRIVATE:

@@ -14,14 +14,12 @@ class WorkerConfig:
 @dataclass(frozen=True)
 class OpenEventConfig:
     target: str
-    rpc_timeout_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
 class RetryConfig:
     publish_max_attempts: int = 5
-    publish_initial_backoff_ms: int = 200
-    publish_max_backoff_ms: int = 5000
+    publish_retry_delay_ms: int = 200
     provider_send_max_attempts: int = 5
     provider_send_retry_delay_ms: int = 1000
     idle_sleep_ms: int = 200

@@ -6,7 +6,6 @@ import signal
 import threading
 
 from .config import load_config
-from .rpc import create_rpc_client
 from .syncer import P2PSyncer
 
 
@@ -18,10 +17,7 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(args.config)
     logging.basicConfig(level=getattr(logging, str(config.logging.get("level", "INFO")).upper()))
 
-    openevent_client = _create_openevent_client(
-        config.openevent.target,
-        config.openevent.rpc_timeout_seconds,
-    )
+    openevent_client = _create_openevent_client(config.openevent.target)
     syncer = P2PSyncer(config, openevent_client)
     shutdown_requested = threading.Event()
     worker_error: list[BaseException] = []
@@ -62,10 +58,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _create_openevent_client(target: str, timeout_seconds: float):
+def _create_openevent_client(target: str):
     from openevent.sdk import OpenEventClient
 
-    return create_rpc_client(OpenEventClient, target, timeout_seconds)
+    return OpenEventClient(target)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from grpc import RpcError, StatusCode
 from requests.exceptions import Timeout as RequestsTimeout
 
 from openevent.im_sdk import ParsedMessage, PublishFailedError
@@ -25,9 +26,18 @@ from openevent.im_p2p_syncer.loop import FatalSyncerError, SingleThreadProcessor
 from openevent.im_p2p_syncer.ids import stable_lark_openapi_uuid
 from openevent.im_p2p_syncer.mapping import P2PMappingIndex
 from openevent.im_p2p_syncer.models import HistoryPage, ProviderEvent, RetryConfig, SendResult
+from openevent.im_p2p_syncer.provider_messages import ProviderMessagePuller
 from openevent.im_p2p_syncer.state import RuntimeState
 from openevent.im_p2p_syncer.syncer import P2PSyncer
 from openevent.sdk.proto import openevent_pb2
+
+
+class FakeRpcError(RpcError):
+    def __init__(self, status_code):
+        self._status_code = status_code
+
+    def code(self):
+        return self._status_code
 
 
 def test_sample_config_loads():
@@ -35,7 +45,7 @@ def test_sample_config_loads():
 
     assert config.version == "v1"
     assert config.worker.principal == 90001
-    assert config.openevent.rpc_timeout_seconds == 10.0
+    assert config.retry.publish_retry_delay_ms == 200
     assert config.retry.provider_send_retry_delay_ms == 1000
     assert config.providers["lark"].options["timeout_seconds"] == 10
     assert config.providers["lark"].sync.history_retry_delay_ms == 1000
@@ -284,12 +294,20 @@ def test_rejects_removed_poll_sync_fields(field):
         parse_config(raw)
 
 
-@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan"), True])
-def test_rejects_invalid_openevent_rpc_timeout(value):
+def test_rejects_removed_openevent_rpc_timeout():
     raw = _valid_raw_config()
-    raw["openevent"]["rpc_timeout_seconds"] = value
+    raw["openevent"]["rpc_timeout_seconds"] = 10
 
-    with pytest.raises(ConfigError, match="rpc_timeout_seconds must be a positive number"):
+    with pytest.raises(ConfigError, match="contains removed fields: rpc_timeout_seconds"):
+        parse_config(raw)
+
+
+@pytest.mark.parametrize("field", ["publish_initial_backoff_ms", "publish_max_backoff_ms"])
+def test_rejects_removed_publish_backoff_fields(field):
+    raw = _valid_raw_config()
+    raw["retry"] = {field: 1}
+
+    with pytest.raises(ConfigError, match="contains removed fields"):
         parse_config(raw)
 
 
@@ -400,14 +418,13 @@ def test_mapping_missing_writes_failed_result_and_clears_request():
         im_client=im_client,
         mapping=P2PMappingIndex(config),
         adapters={"lark": FakeAdapter()},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
+        retry=RetryConfig(publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=state,
         logger=logging.getLogger("test"),
     )
 
-    _complete_history_repair(processor)
     processor.tick()
 
     assert "req-missing" not in state.requests_by_id
@@ -1227,14 +1244,13 @@ def test_bot_principal_can_send_request():
         im_client=im_client,
         mapping=P2PMappingIndex(config),
         adapters={"lark": adapter},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
+        retry=RetryConfig(publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=state,
         logger=logging.getLogger("test"),
     )
 
-    _complete_history_repair(processor)
     processor.tick()
 
     assert adapter.calls[0]["sender_external_user_id"] == "cli_xxx"
@@ -1266,7 +1282,7 @@ def test_provider_send_failure_writes_failed_result_after_max_attempts():
         mapping=P2PMappingIndex(config),
         adapters={"lark": adapter},
         retry=RetryConfig(
-            publish_initial_backoff_ms=0,
+            publish_retry_delay_ms=0,
             provider_send_max_attempts=2,
             provider_send_retry_delay_ms=0,
         ),
@@ -1276,7 +1292,6 @@ def test_provider_send_failure_writes_failed_result_after_max_attempts():
         logger=logging.getLogger("test"),
     )
 
-    _complete_history_repair(processor)
     processor.tick()
     assert "req-provider-fail" in state.requests_by_id
     assert im_client.calls == []
@@ -1316,7 +1331,7 @@ def test_provider_send_exception_is_not_retried_without_retryable_marker():
         mapping=P2PMappingIndex(config),
         adapters={"lark": adapter},
         retry=RetryConfig(
-            publish_initial_backoff_ms=0,
+            publish_retry_delay_ms=0,
             provider_send_max_attempts=2,
         ),
         worker_principal=config.worker.principal,
@@ -1325,7 +1340,6 @@ def test_provider_send_exception_is_not_retried_without_retryable_marker():
         logger=logging.getLogger("test"),
     )
 
-    _complete_history_repair(processor)
     processor.tick()
 
     assert len(adapter.calls) == 1
@@ -1361,7 +1375,8 @@ def test_provider_retry_waits_for_fixed_delay(monkeypatch):
     assert state.next_pending_task() == task
 
 
-def test_publish_retry_exhaustion_raises_fatal_syncer_error():
+@pytest.mark.parametrize("status_code", [StatusCode.UNAVAILABLE, StatusCode.DEADLINE_EXCEEDED])
+def test_publish_retry_exhaustion_uses_fixed_delay(status_code):
     config = load_config("p2p_config.yaml")
     processor = SingleThreadProcessor(
         im_client=SimpleNamespace(),
@@ -1369,9 +1384,41 @@ def test_publish_retry_exhaustion_raises_fatal_syncer_error():
         adapters={},
         retry=RetryConfig(
             publish_max_attempts=2,
-            publish_initial_backoff_ms=0,
+            publish_retry_delay_ms=250,
             provider_send_max_attempts=1,
         ),
+        worker_principal=config.worker.principal,
+        worker_token=config.worker.token,
+        state=RuntimeState(),
+        logger=logging.getLogger("test"),
+    )
+    calls = []
+    waits = []
+    processor._stop_event = SimpleNamespace(wait=lambda seconds: waits.append(seconds) or False)
+
+    def fail_publish():
+        calls.append(1)
+        raise PublishFailedError("publish not committed", retry_safe=True) from FakeRpcError(
+            status_code
+        )
+
+    with pytest.raises(FatalSyncerError):
+        processor._publish_with_retry(fail_publish)
+    assert len(calls) == 2
+    assert waits == [0.25]
+
+
+@pytest.mark.parametrize(
+    "status_code",
+    [StatusCode.UNAUTHENTICATED, StatusCode.PERMISSION_DENIED, StatusCode.CANCELLED],
+)
+def test_publish_permanent_or_unclassified_rpc_error_is_not_retried(status_code):
+    config = load_config("p2p_config.yaml")
+    processor = SingleThreadProcessor(
+        im_client=SimpleNamespace(),
+        mapping=P2PMappingIndex(config),
+        adapters={},
+        retry=RetryConfig(publish_max_attempts=3, publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=RuntimeState(),
@@ -1381,11 +1428,13 @@ def test_publish_retry_exhaustion_raises_fatal_syncer_error():
 
     def fail_publish():
         calls.append(1)
-        raise PublishFailedError("publish not committed", retry_safe=True)
+        raise PublishFailedError("publish not committed", retry_safe=True) from FakeRpcError(
+            status_code
+        )
 
     with pytest.raises(FatalSyncerError):
         processor._publish_with_retry(fail_publish)
-    assert len(calls) == 2
+    assert len(calls) == 1
 
 
 def test_publish_unknown_outcome_is_not_retried():
@@ -1394,7 +1443,7 @@ def test_publish_unknown_outcome_is_not_retried():
         im_client=SimpleNamespace(),
         mapping=P2PMappingIndex(config),
         adapters={},
-        retry=RetryConfig(publish_max_attempts=3, publish_initial_backoff_ms=0),
+        retry=RetryConfig(publish_max_attempts=3, publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=RuntimeState(),
@@ -1419,7 +1468,7 @@ def test_bot_provider_event_publishes_sync_record():
         im_client=im_client,
         mapping=P2PMappingIndex(config),
         adapters={},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
+        retry=RetryConfig(publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=RuntimeState(),
@@ -1446,13 +1495,67 @@ def test_bot_provider_event_publishes_sync_record():
     assert im_client.calls[0]["recipients"] == [10001]
 
 
+def test_degraded_sync_record_too_large_fails_without_marking_message_seen():
+    config = load_config("p2p_config.yaml")
+    state = RuntimeState()
+    calls = []
+
+    def reject_as_too_large(**kwargs):
+        calls.append(kwargs["req"])
+        raise PublishFailedError("payload too large") from FakeRpcError(
+            StatusCode.RESOURCE_EXHAUSTED
+        )
+
+    processor = SingleThreadProcessor(
+        im_client=SimpleNamespace(publish_sync_record=reject_as_too_large),
+        mapping=P2PMappingIndex(config),
+        adapters={},
+        retry=RetryConfig(publish_retry_delay_ms=0),
+        worker_principal=config.worker.principal,
+        worker_token=config.worker.token,
+        state=state,
+        logger=logging.getLogger("test"),
+    )
+    event = ProviderEvent(
+        provider="lark",
+        session_id="oc_p2p_10001_bot",
+        provider_message_id="om_too_large",
+        sender_external_user_id="ou_source",
+        msg_type="text",
+        content_raw={"text": "oversized"},
+        event_ms=1,
+        text="oversized",
+    )
+
+    with pytest.raises(FatalSyncerError, match="degraded sync.record still exceeds"):
+        processor._publish_provider_event(10001, event)
+
+    assert len(calls) == 2
+    assert calls[0].content_omitted is None
+    assert calls[1].content_raw == {
+        "omitted": True,
+        "reason": "message_too_large",
+        "metadata": {
+            "provider": "lark",
+            "session_id": "oc_p2p_10001_bot",
+            "sender_identity_type": "user",
+            "sender_external_user_id": "ou_source",
+            "msg_type": "text",
+        },
+    }
+    assert calls[1].content_omitted is True
+    assert calls[1].omit_reason == "message_too_large"
+    assert state.inbound_seen == set()
+    assert state.latest_event_ms(10001) is None
+
+
 def test_provider_event_with_missing_sender_mapping_is_fatal():
     config = load_config("p2p_config.yaml")
     processor = SingleThreadProcessor(
         im_client=SimpleNamespace(),
         mapping=P2PMappingIndex(config),
         adapters={},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
+        retry=RetryConfig(publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=RuntimeState(),
@@ -1475,11 +1578,12 @@ def test_provider_event_with_missing_sender_mapping_is_fatal():
 
 
 class FakeSyncAdapter(ProviderAdapter):
-    def __init__(self, pages=None):
+    def __init__(self, *, pages=None, events=None):
         self.calls = []
-        self.events = []
-        self.pages = list(pages or [HistoryPage(events=[])])
+        self.events = list(events or [])
+        self.pages = list(pages if pages is not None else [HistoryPage(events=[])])
         self.generation = 0
+        self.stream_error = None
 
     def provider_name(self):
         return "lark"
@@ -1491,7 +1595,7 @@ class FakeSyncAdapter(ProviderAdapter):
         return None
 
     def event_stream_error(self):
-        return None
+        return self.stream_error
 
     def event_stream_generation(self):
         return self.generation
@@ -1507,20 +1611,9 @@ class FakeSyncAdapter(ProviderAdapter):
         raise AssertionError("not used")
 
 
-def _complete_history_repair(processor):
-    while not processor._history_initialized or processor.history_repair_pending():
-        assert processor.tick()
-
-
-class FailedEventStreamAdapter(FakeSyncAdapter):
-    def event_stream_error(self):
-        return RuntimeError("disconnected")
-
-
 class FairWorkAdapter(FakeSyncAdapter):
-    def __init__(self, event):
-        super().__init__()
-        self.events = [event]
+    def __init__(self, *, pages=None, events=None):
+        super().__init__(pages=pages, events=events)
         self.send_calls = []
 
     def send_message(self, **kwargs):
@@ -1529,6 +1622,51 @@ class FairWorkAdapter(FakeSyncAdapter):
             success=True,
             provider_message_id=f"om_sent_{len(self.send_calls)}",
         )
+
+
+class InvalidHistoryAdapter(FakeSyncAdapter):
+    def fetch_history_page(self, **kwargs):
+        raise ProviderDataError("malformed history item")
+
+
+class TransientHistoryAdapter(FakeSyncAdapter):
+    def fetch_history_page(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            raise TransientProviderError("temporarily unavailable")
+        return HistoryPage(events=[])
+
+
+def _start_message_puller(config, adapter, session_highwater_ms=None):
+    puller = ProviderMessagePuller(
+        adapter=adapter,
+        config=config.providers["lark"].sync,
+        logger=logging.getLogger("test"),
+    )
+    puller.start(
+        session_highwater_ms
+        or {"oc_p2p_10001_bot": None}
+    )
+    return puller
+
+
+def _provider_event(
+    provider_message_id,
+    *,
+    session_id="oc_p2p_10001_bot",
+    sender_external_user_id="ou_source",
+    event_ms=1,
+):
+    return ProviderEvent(
+        provider="lark",
+        session_id=session_id,
+        provider_message_id=provider_message_id,
+        sender_external_user_id=sender_external_user_id,
+        msg_type="text",
+        content_raw={"text": provider_message_id},
+        event_ms=event_ms,
+        text=provider_message_id,
+    )
 
 
 def _add_outbound_request(state, seq, request_id, channel_id=10001, principal=90002):
@@ -1547,31 +1685,62 @@ def _add_outbound_request(state, seq, request_id, channel_id=10001, principal=90
     )
 
 
-def test_stable_work_types_rotate_fairly():
+def test_work_types_rotate_fairly():
     config = load_config("p2p_config.yaml")
-    adapter = FakeSyncAdapter()
     processor = SingleThreadProcessor(
         im_client=SimpleNamespace(),
         mapping=P2PMappingIndex(config),
-        adapters={"lark": adapter},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
+        adapters={},
+        retry=RetryConfig(publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=RuntimeState(),
         logger=logging.getLogger("test"),
     )
-    _complete_history_repair(processor)
     calls = []
     processor._process_next_outbound_task = lambda: calls.append("outbound") or True
-    processor._process_next_provider_event = lambda: calls.append("live") or True
+    processor._process_next_provider_event = lambda: calls.append("provider") or True
 
     processor.tick()
     processor.tick()
     processor.tick()
     processor.tick()
 
-    assert calls == ["outbound", "live", "outbound", "live"]
-    assert len(adapter.calls) == 1
+    assert calls == ["outbound", "provider", "outbound", "provider"]
+
+
+def test_history_message_uses_same_channel_serial_path_as_subscription_message():
+    config = load_config("p2p_config.yaml")
+    state = RuntimeState()
+    _add_outbound_request(state, 1, "req-pending")
+    adapter = FairWorkAdapter(
+        pages=[HistoryPage(events=[_provider_event("om_history", event_ms=2)])]
+    )
+    puller = _start_message_puller(config, adapter)
+    order = []
+    im_client = SimpleNamespace()
+    im_client.publish_send_result = lambda **kwargs: order.append("send.result") or 10
+    im_client.publish_sync_record = lambda **kwargs: order.append("sync.record") or 11
+    processor = SingleThreadProcessor(
+        im_client=im_client,
+        mapping=P2PMappingIndex(config),
+        adapters={"lark": adapter},
+        message_pullers={"lark": puller},
+        retry=RetryConfig(publish_retry_delay_ms=0),
+        worker_principal=config.worker.principal,
+        worker_token=config.worker.token,
+        state=state,
+        logger=logging.getLogger("test"),
+    )
+
+    processor.tick()
+    assert order == ["send.result"]
+
+    processor.tick()
+    assert order == ["send.result", "sync.record"]
+    assert state.inbound_seen == {
+        ("lark", "oc_p2p_10001_bot", 10001, "om_history")
+    }
 
 
 def test_outbound_backlog_does_not_starve_other_channel_provider_work():
@@ -1607,21 +1776,23 @@ def test_outbound_backlog_does_not_starve_other_channel_provider_work():
     for seq in range(1, 5):
         _add_outbound_request(state, seq, f"req-{seq}")
     adapter = FairWorkAdapter(
-        ProviderEvent(
-            provider="lark",
-            session_id="oc_second",
-            provider_message_id="om_live_second",
-            sender_external_user_id="ou_second",
-            msg_type="text",
-            content_raw={"text": "live"},
-            event_ms=10,
-        )
+        events=[
+            _provider_event(
+                "om_live_second",
+                session_id="oc_second",
+                sender_external_user_id="ou_second",
+                event_ms=10,
+            )
+        ]
     )
-    adapter.pages = [
-        HistoryPage(events=[], next_page_token="next-channel-one"),
-        HistoryPage(events=[]),
-        HistoryPage(events=[]),
-    ]
+    puller = _start_message_puller(
+        config,
+        adapter,
+        {
+            "oc_p2p_10001_bot": None,
+            "oc_second": None,
+        },
+    )
     im_client = SimpleNamespace(send_results=[], sync_records=[])
     im_client.publish_send_result = (
         lambda **kwargs: im_client.send_results.append(kwargs) or 100 + len(im_client.send_results)
@@ -1633,25 +1804,20 @@ def test_outbound_backlog_does_not_starve_other_channel_provider_work():
         im_client=im_client,
         mapping=P2PMappingIndex(config),
         adapters={"lark": adapter},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
+        message_pullers={"lark": puller},
+        retry=RetryConfig(publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=state,
         logger=logging.getLogger("test"),
     )
 
-    _complete_history_repair(processor)
     processor.tick()
     processor.tick()
     processor.tick()
 
     assert len(adapter.send_calls) == 2
     assert len(im_client.sync_records) == 1
-    assert [call["session_id"] for call in adapter.calls[:3]] == [
-        "oc_p2p_10001_bot",
-        "oc_second",
-        "oc_p2p_10001_bot",
-    ]
     assert len(state.requests_by_id) == 2
 
 
@@ -1663,7 +1829,7 @@ def test_unfinished_request_blocks_provider_work_in_same_channel():
         im_client=SimpleNamespace(),
         mapping=P2PMappingIndex(config),
         adapters={},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
+        retry=RetryConfig(publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=state,
@@ -1673,304 +1839,156 @@ def test_unfinished_request_blocks_provider_work_in_same_channel():
     assert processor._channel_has_pending(10001)
 
 
-def test_event_stream_failure_preempts_outbound_backlog():
+def test_message_pull_failure_preempts_outbound_backlog():
     config = load_config("p2p_config.yaml")
     state = RuntimeState()
     _add_outbound_request(state, 1, "req-pending")
-    adapter = FailedEventStreamAdapter()
+    adapter = FakeSyncAdapter()
+    adapter.stream_error = RuntimeError("disconnected")
+    puller = _start_message_puller(config, adapter)
     processor = SingleThreadProcessor(
         im_client=SimpleNamespace(),
         mapping=P2PMappingIndex(config),
         adapters={"lark": adapter},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
+        message_pullers={"lark": puller},
+        retry=RetryConfig(publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=state,
         logger=logging.getLogger("test"),
     )
 
-    with pytest.raises(FatalSyncerError, match="event stream failed"):
+    with pytest.raises(FatalSyncerError, match="provider message pull failed"):
         processor.tick()
 
     assert "req-pending" in state.requests_by_id
 
 
-def test_event_stream_failure_is_fatal():
+def test_provider_history_data_error_fails_through_message_puller():
     config = load_config("p2p_config.yaml")
-    processor = SingleThreadProcessor(
-        im_client=SimpleNamespace(),
-        mapping=P2PMappingIndex(config),
-        adapters={"lark": FailedEventStreamAdapter()},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
-        worker_principal=config.worker.principal,
-        worker_token=config.worker.token,
-        state=RuntimeState(),
-        logger=logging.getLogger("test"),
-    )
-
-    with pytest.raises(FatalSyncerError, match="event stream failed"):
-        processor.tick()
-
-
-class InvalidHistoryAdapter(FakeSyncAdapter):
-    def fetch_history_page(self, **kwargs):
-        raise ProviderDataError("malformed history item")
-
-
-def test_provider_history_data_error_is_fatal():
-    config = load_config("p2p_config.yaml")
-    processor = SingleThreadProcessor(
-        im_client=SimpleNamespace(),
-        mapping=P2PMappingIndex(config),
-        adapters={"lark": InvalidHistoryAdapter()},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
-        worker_principal=config.worker.principal,
-        worker_token=config.worker.token,
-        state=RuntimeState(),
-        logger=logging.getLogger("test"),
-    )
-
-    with pytest.raises(FatalSyncerError, match="provider history failed"):
-        processor.tick()
-
-
-class TransientHistoryAdapter(FakeSyncAdapter):
-    def fetch_history_page(self, **kwargs):
-        self.calls.append(kwargs)
-        if len(self.calls) == 1:
-            raise TransientProviderError("temporarily unavailable")
-        return HistoryPage(events=[])
-
-
-def test_transient_history_error_keeps_scan_cursor_for_fixed_delay(monkeypatch):
-    config = load_config("p2p_config.yaml")
-    now = {"value": 1000.0}
-    monkeypatch.setattr("openevent.im_p2p_syncer.loop.time.time", lambda: now["value"])
-    adapter = TransientHistoryAdapter()
+    adapter = InvalidHistoryAdapter()
+    puller = _start_message_puller(config, adapter)
     processor = SingleThreadProcessor(
         im_client=SimpleNamespace(),
         mapping=P2PMappingIndex(config),
         adapters={"lark": adapter},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
+        message_pullers={"lark": puller},
+        retry=RetryConfig(publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=RuntimeState(),
         logger=logging.getLogger("test"),
     )
 
-    processor.tick()
-    first_scan = processor._history_scans[10001]
-    processor.tick()
+    with pytest.raises(FatalSyncerError, match="provider message pull failed"):
+        processor.tick()
+
+
+def test_transient_history_error_keeps_query_for_fixed_delay(monkeypatch):
+    config = load_config("p2p_config.yaml")
+    now = {"value": 1000.0}
+    monkeypatch.setattr("openevent.im_p2p_syncer.provider_messages.time.time", lambda: now["value"])
+    adapter = TransientHistoryAdapter()
+    puller = _start_message_puller(config, adapter)
+
+    assert puller.take_message() is None
+    assert puller.take_message() is None
     assert len(adapter.calls) == 1
 
     now["value"] += config.providers["lark"].sync.history_retry_delay_ms / 1000
-    processor.tick()
+    assert puller.take_message() is None
 
     assert len(adapter.calls) == 2
     assert adapter.calls[1] == adapter.calls[0]
-    assert first_scan is not None
 
 
-class PermanentHistoryAdapter(FakeSyncAdapter):
-    def fetch_history_page(self, **kwargs):
-        raise PermanentProviderError("permission denied")
-
-
-def test_permanent_provider_history_error_is_fatal():
+def test_provider_message_puller_requires_ack_and_delivers_history_before_live():
     config = load_config("p2p_config.yaml")
-    processor = SingleThreadProcessor(
-        im_client=SimpleNamespace(),
-        mapping=P2PMappingIndex(config),
-        adapters={"lark": PermanentHistoryAdapter()},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
-        worker_principal=config.worker.principal,
-        worker_token=config.worker.token,
-        state=RuntimeState(),
-        logger=logging.getLogger("test"),
+    history_event = _provider_event("om_history", event_ms=1)
+    live_event = _provider_event("om_live", event_ms=2)
+    adapter = FakeSyncAdapter(
+        pages=[HistoryPage(events=[history_event])],
+        events=[live_event],
     )
+    puller = _start_message_puller(config, adapter)
 
-    with pytest.raises(FatalSyncerError, match="provider history failed"):
-        processor.tick()
+    assert puller.take_message() == history_event
+    assert puller.take_message() is None
 
-def test_stable_connection_does_not_schedule_periodic_history(monkeypatch):
+    puller.acknowledge(history_event)
+    assert puller.take_message() == live_event
+
+
+def test_reconnect_handoff_uses_completed_window_and_is_not_periodic(monkeypatch):
     config = load_config("p2p_config.yaml")
-    adapter = FakeSyncAdapter()
     now = {"value": 1000.0}
-    monkeypatch.setattr("openevent.im_p2p_syncer.loop.time.time", lambda: now["value"])
-    processor = SingleThreadProcessor(
-        im_client=SimpleNamespace(),
-        mapping=P2PMappingIndex(config),
-        adapters={"lark": adapter},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
-        worker_principal=config.worker.principal,
-        worker_token=config.worker.token,
-        state=RuntimeState(),
-        logger=logging.getLogger("test"),
-    )
-    processor.initialize_history_repair(anchor_ms=1000000)
-    processor.tick()
-    assert len(adapter.calls) == 1
-
-    now["value"] += 86400
-    processor.tick()
-    processor.tick()
-
-    assert len(adapter.calls) == 1
-    assert adapter.calls[0]["end_ms"] == 1000000
-
-
-def test_reconnect_schedules_one_history_repair(monkeypatch):
-    config = load_config("p2p_config.yaml")
-    adapter = FakeSyncAdapter()
-    now = {"value": 1000.0}
-    monkeypatch.setattr("openevent.im_p2p_syncer.loop.time.time", lambda: now["value"])
-    processor = SingleThreadProcessor(
-        im_client=SimpleNamespace(),
-        mapping=P2PMappingIndex(config),
-        adapters={"lark": adapter},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
-        worker_principal=config.worker.principal,
-        worker_token=config.worker.token,
-        state=RuntimeState(),
-        logger=logging.getLogger("test"),
-    )
-    processor.initialize_history_repair(anchor_ms=1000000)
-    processor.tick()
-
-    now["value"] = 2000.0
-    adapter.generation = 1
-    processor.tick()
-    processor.tick()
-
-    assert len(adapter.calls) == 2
-    assert adapter.calls[1]["start_ms"] == 1000000 - config.providers["lark"].sync.history_overlap_ms
-    assert adapter.calls[1]["end_ms"] == 2000000
-
-
-def test_reconnect_repair_precedes_buffered_live_event():
-    config = load_config("p2p_config.yaml")
-    adapter = FakeSyncAdapter()
-    im_client = SimpleNamespace(sync_records=[])
-    im_client.publish_sync_record = (
-        lambda **kwargs: im_client.sync_records.append(kwargs) or len(im_client.sync_records)
-    )
-    processor = SingleThreadProcessor(
-        im_client=im_client,
-        mapping=P2PMappingIndex(config),
-        adapters={"lark": adapter},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
-        worker_principal=config.worker.principal,
-        worker_token=config.worker.token,
-        state=RuntimeState(),
-        logger=logging.getLogger("test"),
-    )
-    _complete_history_repair(processor)
-    adapter.events.append(
-        ProviderEvent(
-            provider="lark",
-            session_id="oc_p2p_10001_bot",
-            provider_message_id="om_after_reconnect",
-            sender_external_user_id="ou_source",
-            msg_type="text",
-            content_raw={"text": "live"},
-            event_ms=1000,
-        )
-    )
-    adapter.generation = 1
-
-    processor.tick()
-    assert im_client.sync_records == []
-
-    processor.tick()
-    assert len(im_client.sync_records) == 1
-
-
-def test_history_highwater_advances_only_after_last_page(monkeypatch):
-    config = load_config("p2p_config.yaml")
+    monkeypatch.setattr("openevent.im_p2p_syncer.provider_messages.time.time", lambda: now["value"])
     adapter = FakeSyncAdapter(
         pages=[
             HistoryPage(events=[], next_page_token="next"),
             HistoryPage(events=[]),
+            HistoryPage(events=[]),
         ]
     )
-    monkeypatch.setattr("openevent.im_p2p_syncer.loop.time.time", lambda: 1000.0)
-    processor = SingleThreadProcessor(
-        im_client=SimpleNamespace(),
-        mapping=P2PMappingIndex(config),
-        adapters={"lark": adapter},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
-        worker_principal=config.worker.principal,
-        worker_token=config.worker.token,
-        state=RuntimeState(),
-        logger=logging.getLogger("test"),
-    )
+    puller = _start_message_puller(config, adapter)
 
-    processor.tick()
-    assert processor._history_highwater_ms[10001] is None
-
-    processor.tick()
-    assert processor._history_highwater_ms[10001] == 1000000
+    assert puller.take_message() is None
+    assert puller.take_message() is None
     assert adapter.calls[1]["page_token"] == "next"
 
+    now["value"] = 2000.0
+    adapter.generation = 1
+    assert puller.take_message() is None
+    assert adapter.calls[2]["start_ms"] == (
+        1000000 - config.providers["lark"].sync.history_overlap_ms
+    )
+    assert adapter.calls[2]["end_ms"] == 2000000
 
-def test_history_repair_recovers_watermark_from_openevent_state(monkeypatch):
+    now["value"] += 86400
+    assert puller.take_message() is None
+    assert len(adapter.calls) == 3
+
+
+def test_reconnect_handoff_precedes_buffered_live_message(monkeypatch):
     config = load_config("p2p_config.yaml")
-    state = RuntimeState()
-    state.add_sync_record(
-        ParsedMessage(
-            seq=1,
-            channel_id=10001,
-            principal=10001,
-            recipients=[90002],
-            kind="sync.record",
-            payload={},
-            data={"provider_message_id": "om_old"},
-            event_ms=800000,
-        ),
-        "lark",
-        "oc_p2p_10001_bot",
-    )
+    now = {"value": 1000.0}
+    monkeypatch.setattr("openevent.im_p2p_syncer.provider_messages.time.time", lambda: now["value"])
     adapter = FakeSyncAdapter()
-    monkeypatch.setattr("openevent.im_p2p_syncer.loop.time.time", lambda: 1000.0)
-    processor = SingleThreadProcessor(
-        im_client=SimpleNamespace(),
-        mapping=P2PMappingIndex(config),
-        adapters={"lark": adapter},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
-        worker_principal=config.worker.principal,
-        worker_token=config.worker.token,
-        state=state,
-        logger=logging.getLogger("test"),
-    )
+    puller = _start_message_puller(config, adapter)
+    assert puller.take_message() is None
 
-    processor.tick()
+    history_event = _provider_event("om_reconnect_history", event_ms=2)
+    live_event = _provider_event("om_reconnect_live", event_ms=3)
+    adapter.pages.append(HistoryPage(events=[history_event]))
+    adapter.events.append(live_event)
+    adapter.generation = 1
 
-    assert adapter.calls[0]["start_ms"] == 800000 - config.providers["lark"].sync.history_overlap_ms
+    assert puller.take_message() == history_event
+    puller.acknowledge(history_event)
+    assert puller.take_message() == live_event
 
 
-def test_initial_history_window_uses_pre_scan_anchor(monkeypatch):
+@pytest.mark.parametrize(
+    ("highwater_ms", "expected_start_ms"),
+    [
+        (None, 700000),
+        (800000, 500000),
+    ],
+)
+def test_initial_handoff_window_uses_recovered_watermark_or_lookback(
+    monkeypatch,
+    highwater_ms,
+    expected_start_ms,
+):
     config = load_config("p2p_config.yaml")
+    monkeypatch.setattr("openevent.im_p2p_syncer.provider_messages.time.time", lambda: 1000.0)
     adapter = FakeSyncAdapter()
-    monkeypatch.setattr("openevent.im_p2p_syncer.loop.time.time", lambda: 1000.0)
-    state = RuntimeState()
-    processor = SingleThreadProcessor(
-        im_client=SimpleNamespace(),
-        mapping=P2PMappingIndex(config),
-        adapters={"lark": adapter},
-        retry=RetryConfig(publish_initial_backoff_ms=0),
-        worker_principal=config.worker.principal,
-        worker_token=config.worker.token,
-        state=state,
-        logger=logging.getLogger("test"),
-    )
-    processor.initialize_history_repair(anchor_ms=700000)
-    state.mark_sync_record(
-        ("lark", "oc_p2p_10001_bot", 10001, "om_live"),
-        10001,
-        999000,
+    puller = _start_message_puller(
+        config,
+        adapter,
+        {"oc_p2p_10001_bot": highwater_ms},
     )
 
-    processor.tick()
-
-    assert adapter.calls[0]["start_ms"] == 700000 - config.providers["lark"].sync.history_lookback_ms
+    assert puller.take_message() is None
+    assert adapter.calls[0]["start_ms"] == expected_start_ms
     assert adapter.calls[0]["end_ms"] == 1000000

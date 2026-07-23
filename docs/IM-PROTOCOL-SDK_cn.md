@@ -15,7 +15,6 @@ SDK 负责：
 - 提供 `im.v1` 数据模型、编码、解析和发布辅助
 - 封装基于环境中已安装 `openevent-sdk` 的标准发布入口
 - 固化协议写入口径，减少业务模块和 Sync Worker 重复构造 payload
-- 提供 `send.request -> send.result` 的超时判定工具
 
 SDK 不负责：
 
@@ -52,7 +51,6 @@ IM Sync Worker
 ```python
 UInt64 = int          # 0 <= value <= 2**64 - 1
 TimestampMs = int     # Unix epoch milliseconds, value >= 0
-DurationMs = int      # elapsed milliseconds, value >= 0
 JsonObject = dict[str, object]
 
 client = create_client(openevent_client: OpenEventClient) -> ImProtocolClient
@@ -117,12 +115,13 @@ client.parse_message(message: EventMessage) -> ParsedMessage
 
 SDK 公开错误类型：
 
-- `INVALID_KIND`
-- `MALFORMED_PAYLOAD`
-- `PUBLISH_FAILED`
-- `UNSUPPORTED_PROTOCOL_VERSION`
+- `ImProtocolError`
+- `InvalidKindError`
+- `MalformedPayloadError`
+- `PublishFailedError`
 
-OpenEvent 发布失败会以 `PUBLISH_FAILED` 暴露给调用方；非法 payload、非法字段类型或不支持的协议版本会以对应错误暴露给调用方。
+`ImProtocolError` 是协议输入错误的基类；非法 kind 抛出 `InvalidKindError`，非法 payload
+或字段类型抛出 `MalformedPayloadError`，OpenEvent 发布失败抛出 `PublishFailedError`。
 
 只有本次调用已经确定未提交，或者对账完成且没有找到匹配消息时，
 `PublishFailedError.retry_safe` 才为 `true`。对账无法证明任何一种结果时，

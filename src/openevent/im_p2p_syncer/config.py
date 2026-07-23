@@ -51,27 +51,25 @@ def parse_config(raw: dict[str, Any]) -> SyncerConfig:
     )
 
     openevent_raw = _obj(raw.get("openevent"), "openevent")
+    _reject_removed_fields(openevent_raw, {"rpc_timeout_seconds"}, "openevent")
     openevent = OpenEventConfig(
         target=_str(openevent_raw.get("target"), "openevent.target"),
-        rpc_timeout_seconds=_positive_number(
-            openevent_raw.get("rpc_timeout_seconds", 10.0),
-            "openevent.rpc_timeout_seconds",
-        ),
     )
 
     retry_raw = _obj(raw.get("retry", {}), "retry")
+    _reject_removed_fields(
+        retry_raw,
+        {"publish_initial_backoff_ms", "publish_max_backoff_ms"},
+        "retry",
+    )
     retry = RetryConfig(
         publish_max_attempts=_positive_int(
             retry_raw.get("publish_max_attempts", 5),
             "retry.publish_max_attempts",
         ),
-        publish_initial_backoff_ms=_non_negative_int(
-            retry_raw.get("publish_initial_backoff_ms", 200),
-            "retry.publish_initial_backoff_ms",
-        ),
-        publish_max_backoff_ms=_non_negative_int(
-            retry_raw.get("publish_max_backoff_ms", 5000),
-            "retry.publish_max_backoff_ms",
+        publish_retry_delay_ms=_non_negative_int(
+            retry_raw.get("publish_retry_delay_ms", 200),
+            "retry.publish_retry_delay_ms",
         ),
         provider_send_max_attempts=_positive_int(
             retry_raw.get("provider_send_max_attempts", 5),

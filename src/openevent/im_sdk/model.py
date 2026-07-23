@@ -6,7 +6,6 @@ from typing import Any
 JsonObject = dict[str, Any]
 UInt64 = int
 TimestampMs = int
-DurationMs = int
 
 
 @dataclass(frozen=True)

@@ -24,12 +24,6 @@ def require_timestamp_ms(value: Any, field_name: str) -> int:
     return value
 
 
-def require_duration_ms(value: Any, field_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise MalformedPayloadError(f"{field_name} must be a non-negative duration")
-    return value
-
-
 def require_non_empty_str(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value:
         raise MalformedPayloadError(f"{field_name} must be a non-empty string")

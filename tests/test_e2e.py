@@ -254,12 +254,10 @@ def test_p2p_syncer_round_trips_with_mock_im_service(monkeypatch, mock_im_server
         },
         "openevent": {
             "target": os.environ["OPENEVENT_IM_E2E_TARGET"],
-            "rpc_timeout_seconds": 10,
         },
         "retry": {
             "publish_max_attempts": 2,
-            "publish_initial_backoff_ms": 1,
-            "publish_max_backoff_ms": 5,
+            "publish_retry_delay_ms": 1,
             "provider_send_max_attempts": 2,
             "idle_sleep_ms": 20,
         },

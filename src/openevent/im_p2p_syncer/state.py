@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import heapq
-import time
 from dataclasses import dataclass
 
 from openevent.im_sdk import ParsedMessage
@@ -43,8 +42,6 @@ class RuntimeState:
         self.requests_by_id: dict[str, OutboundTask] = {}
         self.pending_heap: list[tuple[int, str]] = []
         self.blocked_by_channel: dict[int, str] = {}
-        self.provider_send_attempts: dict[str, int] = {}
-        self.provider_retry_ready_at: dict[str, float] = {}
         self.send_result_by_provider_message: dict[InboundKey, int] = {}
         self.latest_event_ms_by_channel: dict[int, int] = {}
 
@@ -77,9 +74,6 @@ class RuntimeState:
             task = self.requests_by_id.get(request_id)
             if task is None or task.seq != seq or request_id in self.completed_request_ids:
                 continue
-            if time.monotonic() < self.provider_retry_ready_at.get(request_id, 0):
-                deferred.append((seq, request_id))
-                continue
             blocked_request_id = self.blocked_by_channel.get(task.channel_id)
             if blocked_request_id is not None and blocked_request_id != request_id:
                 deferred.append((seq, request_id))
@@ -91,11 +85,6 @@ class RuntimeState:
         for item in deferred:
             heapq.heappush(self.pending_heap, item)
         return None
-
-    def retry_send_request(self, task: OutboundTask, delay_ms: int) -> None:
-        if task.request_id in self.requests_by_id and task.request_id not in self.completed_request_ids:
-            self.provider_retry_ready_at[task.request_id] = time.monotonic() + delay_ms / 1000
-            heapq.heappush(self.pending_heap, (task.seq, task.request_id))
 
     def channel_has_pending(self, channel_id: int) -> bool:
         return any(task.channel_id == channel_id for task in self.requests_by_id.values())
@@ -111,18 +100,9 @@ class RuntimeState:
         self.completed_request_ids.add(task.request_id)
         self.requests_by_id.pop(task.request_id, None)
         self._unblock_channel(task.channel_id, task.request_id)
-        self.provider_send_attempts.pop(task.request_id, None)
-        self.provider_retry_ready_at.pop(task.request_id, None)
         self.send_result_by_provider_message[
             (provider, session_id, task.channel_id, provider_message_id)
         ] = seq
-
-    def mark_send_result_failed(self, task: OutboundTask) -> None:
-        self.completed_request_ids.add(task.request_id)
-        self.requests_by_id.pop(task.request_id, None)
-        self._unblock_channel(task.channel_id, task.request_id)
-        self.provider_send_attempts.pop(task.request_id, None)
-        self.provider_retry_ready_at.pop(task.request_id, None)
 
     def add_send_result(self, parsed: ParsedMessage, provider: str, session_id: str) -> None:
         result = TerminalResult(
@@ -163,8 +143,6 @@ class RuntimeState:
         self.terminal_results_by_id[parsed.request_id] = result
         self.requests_by_id.pop(parsed.request_id, None)
         self._unblock_channel(task.channel_id, task.request_id)
-        self.provider_send_attempts.pop(parsed.request_id, None)
-        self.provider_retry_ready_at.pop(parsed.request_id, None)
         if parsed.data.get("status") != "SUCCESS":
             return
         provider_message_id = parsed.data.get("provider_message_id")
@@ -199,11 +177,6 @@ class RuntimeState:
 
     def latest_event_ms(self, channel_id: int) -> int | None:
         return self.latest_event_ms_by_channel.get(channel_id)
-
-    def record_provider_send_attempt(self, request_id: str) -> int:
-        attempts = self.provider_send_attempts.get(request_id, 0) + 1
-        self.provider_send_attempts[request_id] = attempts
-        return attempts
 
     def _unblock_channel(self, channel_id: int, request_id: str) -> None:
         if self.blocked_by_channel.get(channel_id) == request_id:

@@ -11,8 +11,6 @@ openevent:
 retry:
   publish_max_attempts: 5
   publish_retry_delay_ms: 200
-  provider_send_max_attempts: 5
-  provider_send_retry_delay_ms: 1000
   idle_sleep_ms: 200
 
 logging:

@@ -37,19 +37,23 @@ IM P2P Syncer 是独立进程模块，在 IM 平台单聊会话和 OpenEvent cha
 | 可处理 channel | `protocol == "im.v1"`，`description.session_type == "p2p"`，在 mapping 中，且为包含 user、bot 和 Sync Worker 三方 principal 的 private channel |
 | `send.request` | 只消费，不发布；目标会话由 `channel_id -> (provider, session_id)` 决定；OpenEvent 发送方由 `send.request.principal` 在该 channel 的 mapping 中校验 |
 | `sync.record` | 由 Worker 发布；OpenEvent `principal` 为发送者映射 principal，`recipients` 为单聊对端 principal |
-| `send.result` | 由 Worker 发布；OpenEvent `principal` 为 Worker principal，`recipients` 为对应 `send.request` 发起 principal |
+| `send.result` | 只在 Provider 发送成功后由 Worker 发布；OpenEvent `principal` 为 Worker principal，`recipients` 为对应 `send.request` 发起 principal |
 | channel ACL | channel 必须为 private，并覆盖单聊双方 principal 与 Sync Worker principal；ACL 是权限边界，`recipients` 不是权限边界 |
 
-Provider 发送失败不要求业务方重发。只有明确限流、HTTP 5xx、连接异常或超时会按固定
-`retry.provider_send_retry_delay_ms` 间隔重试，直到发送成功，或同一 request 的发送尝试次数
-达到 `retry.provider_send_max_attempts`。超过上限后，Worker 写出
-`send.result(status=FAILED, error_code=PROVIDER_SEND_FAILED)`，清除该 request，
-后续不再自动处理它；若 `send.request.principal` 不在该 channel 的 mapping 内，
-Worker 写出 `send.result(status=FAILED, error_code=MAPPING_MISSING)` 并终止该 request。
+Provider 发送失败不要求业务方重发。任何 Provider 失败响应、发送异常、成功响应缺少
+`provider_message_id` 或发送 principal 缺少 mapping，都会立即使 Worker 退出且不写 `send.result`。
+原稳定 `send.request` 保持未完成，修复并重启后恢复同一 request。当前 Worker 只为成功发送写
+`send.result`。
 
-可重试错误在达到上限前会阻塞该 P2P channel；其他 channel 仍可处理。凭据失效、权限缺失、
-参数错误、目标会话不可用或成功响应缺少 `message_id` 等错误不重试，立即形成最终失败结果。
-业务方需要观察 `send.result` 并按业务语义决定是否修复配置或创建新的业务动作。
+发送失败会退出 Worker，因而暂停它配置的全部 channel。运维必须先修复失败原因再重启，并为进程
+管理器配置退避，避免快速重启循环。
+
+该 fail-stop 策略不会在 OpenEvent 中留下失败终态，运维必须通过进程退出状态和日志定位原因。永久
+坏 request 会在每次重启后再次执行，直到配置或 payload 被修复；当前 Worker 不提供 dead-letter
+或人工跳过机制。
+
+如果 Provider 已接受发送但响应丢失，恢复会复用同一 request 派生的 Provider UUID；能否避免重复
+投递仍依赖 Provider 正确实现该幂等键。
 
 ## 3. 映射模型
 
@@ -120,9 +124,9 @@ mappings:
 im-p2p-syncer --config /etc/openevent/im-sync-worker.yaml
 ```
 
-进程收到 `SIGINT` 或 `SIGTERM` 时会停止 Lark 长连接并尝试优雅退出。业务方通过 OpenEvent 写入 `send.request`，Worker 负责在 P2P channel 内消费请求并回写 `send.result`；Provider 侧真实消息回流仍同步为普通 `sync.record`，不会触发新的 Provider 发送。
+进程收到 `SIGINT` 或 `SIGTERM` 时会停止 Lark 长连接并尝试优雅退出。业务方通过 OpenEvent 写入 `send.request`，Worker 负责在 P2P channel 内消费请求并在成功发送后回写 `send.result`；Provider 侧真实消息回流仍同步为普通 `sync.record`，不会触发新的 Provider 发送。
 
-同一个 P2P channel 内有未完成 `send.request` 时，Worker 会先处理或终止该请求，再继续推进该 channel 的后续同步。业务方应观察 `send.result`，不要为同一业务发送动作重复写入新的 `send.request`。
+同一个 P2P channel 内有未完成 `send.request` 时，Worker 必须先成功发送该请求，再继续推进该 channel 的后续同步。fatal 失败会保留未完成 request，供修复后重启恢复。业务方应观察成功 `send.result`，不要为同一业务发送动作重复写入新的 `send.request`。
 
 ## 5. Feishu/Lark 支持
 
@@ -152,7 +156,7 @@ Feishu/Lark 约束：
 - 出站发送基础实现至少支持 `msg_type="text"`，`content={"text": "..."}`。平台不按普通用户 `open_id` 代发；Worker 必须先校验 `send.request.principal` 属于该 P2P channel 的 bot mapping，再使用配置中的应用/机器人身份，由该应用/机器人向 `session_id` 对应的单聊 `chat_id` 发送消息
 - 应用/机器人身份由 `providers[].credentials` 指定，并在 `mappings[]` 中用 `identity_type="bot"` 显式描述；其 `external_user_id` 必须等于 `credentials.app_id`。`identity_type="user"` 的 `external_user_id` 表示人类用户的 `open_id`。`im.message.receive_v1` 实时事件和 `message.list` 历史消息都按 sender type 将 user、app/bot 分别映射到 user、bot principal 后发布 `sync.record`，不能按发送方向过滤
 - `message.create` 成功并返回 `message_id` 后直接按成功处理，不再调用 `message.get` 做额外确认
-- 只有明确限流、HTTP 5xx、连接异常和超时会重试；凭据、权限、参数、目标会话和响应字段错误立即写出最终失败结果
+- 任何 `message.create` 失败响应或异常都直接保留 request 并退出 Worker
 
 Provider 消息拉取器把 `im.message.receive_v1` 订阅和 `message.list` 连接交接封装成同一条带确认的消息流。SDK 回调先校验实时事件并写入有界队列；队列满或映射内消息格式错误时回调抛错，使本次投递失败，同时使 Worker 退出并由进程管理器重启。业务状态、映射、幂等和 OpenEvent 发布仍只在 Worker 单线程主循环中修改。
 
@@ -166,7 +170,7 @@ Provider `message_id` 是入站幂等键和发送结果关联键。`page_token` 
 
 OpenEvent `seq` 表示记录持久写入的顺序，不表示 IM 消息业务时间。历史接口返回的较早消息可能以更大的 `seq` 写入；消费者必须用 `timestamps.event_ms` 理解消息业务时间。
 
-## 6. 可靠性与失败结果
+## 6. 可靠性与 Fail-Stop 行为
 
 | 场景 | 策略 |
 | --- | --- |
@@ -179,8 +183,8 @@ OpenEvent `seq` 表示记录持久写入的顺序，不表示 IM 消息业务时
 | 实时事件队列满或回调失败 | 回调抛错，本次事件确认失败；Worker 退出，重启后的消息拉取器重新执行连接交接 |
 | 消息拉取器内部发生明确临时的历史查询失败 | 保留该 session 的查询窗口和 `page_token`，等待 `history_retry_delay_ms` 后重试；不引入全局恢复阶段，也不阻塞其他 channel |
 | 消息拉取器内部发生永久、坏数据或未分类的历史查询失败 | 不确认相关消息，Worker 退出 |
-| `send.request.principal` 不在 mapping 内 | 写出 `send.result(status=FAILED, error_code=MAPPING_MISSING)` 并结束该 request |
-| Provider 发送失败 | 临时错误按固定间隔有限重试；非临时错误立即写出 `send.result(status=FAILED, error_code=PROVIDER_SEND_FAILED)` 并结束该 request |
+| `send.request.principal` 不在 mapping 内 | 保留未完成 request，不写 `send.result`，Worker 退出 |
+| Provider 发送失败 | 保留未完成 request，不写 `send.result`，Worker 立即退出 |
 | OpenEvent 发布已确认未提交，且底层状态为 `UNAVAILABLE` 或 `DEADLINE_EXCEEDED` | 按 `retry.publish_retry_delay_ms` 固定间隔有限重试，超过 `retry.publish_max_attempts` 后退出进程 |
 | OpenEvent 发布结果不确定且对账失败 | 不再发布，立即退出，避免产生重复消息 |
 | OpenEvent 因 payload 超限拒绝完整 `sync.record` | 改写并发布超大消息降级 `sync.record`，只记录 `provider_message_id`、消息类型、时间、发送者等轻量 meta，并按 [`IM_PROTOCOL_cn.md`](IM_PROTOCOL_cn.md) 写入 `message_too_large` 降级字段 |
@@ -256,8 +260,6 @@ mappings:
 | `openevent.target` | 是 | string，OpenEvent 公共 gRPC endpoint，必须非空 |
 | `retry.publish_max_attempts` | 否 | integer，OpenEvent 写入失败最大尝试次数，默认 `5`，必须大于 0 |
 | `retry.publish_retry_delay_ms` | 否 | integer，明确未提交且底层状态为 `UNAVAILABLE` 或 `DEADLINE_EXCEEDED` 时的固定重试间隔，默认 `200`，必须大于等于 0 |
-| `retry.provider_send_max_attempts` | 否 | integer，单条 `send.request` Provider 发送失败最大尝试次数，默认 `5`，必须大于 0 |
-| `retry.provider_send_retry_delay_ms` | 否 | integer，Provider 临时失败的固定重试间隔，默认 `1000`，必须大于等于 0 |
 | `retry.idle_sleep_ms` | 否 | integer，主循环空闲休眠，默认 `200`，必须大于等于 0 |
 | `logging.*` | 否 | object，日志级别等基础配置 |
 | `principal_tokens[]` | 是 | array，用户 OpenEvent principal token 数组；`principal` 为 uint64 且唯一，`token` 为非空 string，且不得包含 `worker.principal` |
@@ -306,4 +308,5 @@ mappings:
 11. mapping 引用的参与方 principal 都存在 token
 12. Sync Worker principal 可读写 channel
 13. Lark 应用已订阅 `im.message.receive_v1`，且历史消息读取权限满足连接交接范围
-14. 进程管理器会在长连接永久失败导致 Worker 退出后重启进程
+14. 进程管理器会在长连接永久失败或 fatal 发送失败导致 Worker 退出后重启进程
+15. 进程管理器已配置重启退避和告警，永久坏 request 或配置错误不会形成快速重启循环

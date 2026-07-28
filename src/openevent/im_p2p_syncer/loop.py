@@ -137,15 +137,12 @@ class SingleThreadProcessor:
             sender_external_user_id = self._mapping.sender_external_user_id(
                 task.channel_id, task.principal, "bot"
             )
-        except KeyError:
-            self._logger.error(
-                "mapping_missing request_id=%s channel_id=%s principal=%s",
-                task.request_id,
-                task.channel_id,
-                task.principal,
-            )
-            self._publish_mapping_missing_result(task)
-            return
+        except KeyError as exc:
+            raise FatalSyncerError(
+                f"send.request principal has no bot mapping: "
+                f"request_id={task.request_id} channel_id={task.channel_id} "
+                f"principal={task.principal}"
+            ) from exc
 
         adapter = self._adapters[provider]
         try:
@@ -157,14 +154,25 @@ class SingleThreadProcessor:
                 request_id=task.request_id,
             )
         except Exception as exc:
-            result = SendResult(
-                success=False,
-                error_code=type(exc).__name__,
-                error_message=str(exc),
-            )
+            raise FatalSyncerError(
+                f"provider send raised: request_id={task.request_id} "
+                f"channel_id={task.channel_id} error={type(exc).__name__}: {exc}"
+            ) from exc
         if not result.success or not result.provider_message_id:
-            self._handle_provider_send_failure(task, result)
-            return
+            error_code = result.error_code or "PROVIDER_SEND_FAILED"
+            error_message = result.error_message or "Provider send failed without provider_message_id"
+            self._logger.error(
+                "provider_send_failed request_id=%s channel_id=%s error_code=%s error=%s",
+                task.request_id,
+                task.channel_id,
+                error_code,
+                error_message,
+            )
+            raise FatalSyncerError(
+                f"provider send failed: request_id={task.request_id} "
+                f"channel_id={task.channel_id} "
+                f"error_code={error_code} error={error_message}"
+            )
 
         event_ms = int(time.time() * 1000)
         seq = self._publish_with_retry(
@@ -188,67 +196,6 @@ class SingleThreadProcessor:
             task.request_id,
             seq,
             result.provider_message_id,
-        )
-
-    def _handle_provider_send_failure(self, task: OutboundTask, result: SendResult) -> None:
-        attempts = self._state.record_provider_send_attempt(task.request_id)
-        self._log_send_failure(task, result, attempts)
-        if result.retryable and attempts < self._retry.provider_send_max_attempts:
-            self._state.retry_send_request(task, self._retry.provider_send_retry_delay_ms)
-            return
-
-        event_ms = int(time.time() * 1000)
-        error_code = result.error_code or "PROVIDER_SEND_FAILED"
-        error_message = result.error_message or "Provider send failed without provider_message_id"
-        seq = self._publish_with_retry(
-            lambda: self._im_client.publish_send_result(
-                principal=self._worker_principal,
-                token=self._worker_token,
-                channel_id=task.channel_id,
-                recipients=[task.principal],
-                req=SendResultInput(
-                    request_id=task.request_id,
-                    prev_seq=task.seq,
-                    status="FAILED",
-                    error_code="PROVIDER_SEND_FAILED",
-                    error_message=f"{error_code}: {error_message}",
-                    event_ms=event_ms,
-                ),
-            )
-        )
-        self._state.mark_send_result_failed(task)
-        self._logger.warning(
-            "send_result_failed_published request_id=%s openevent_seq=%s error_code=%s attempts=%s",
-            task.request_id,
-            seq,
-            "PROVIDER_SEND_FAILED",
-            attempts,
-        )
-
-    def _publish_mapping_missing_result(self, task: OutboundTask) -> None:
-        event_ms = int(time.time() * 1000)
-        seq = self._publish_with_retry(
-            lambda: self._im_client.publish_send_result(
-                principal=self._worker_principal,
-                token=self._worker_token,
-                channel_id=task.channel_id,
-                recipients=[task.principal],
-                req=SendResultInput(
-                    request_id=task.request_id,
-                    prev_seq=task.seq,
-                    status="FAILED",
-                    error_code="MAPPING_MISSING",
-                    error_message="send.request principal has no bot mapping in this P2P channel",
-                    event_ms=event_ms,
-                ),
-            )
-        )
-        self._state.mark_send_result_failed(task)
-        self._logger.warning(
-            "send_result_failed_published request_id=%s openevent_seq=%s error_code=%s",
-            task.request_id,
-            seq,
-            "MAPPING_MISSING",
         )
 
     def _publish_provider_event(self, channel_id: int, event: ProviderEvent) -> None:
@@ -372,17 +319,6 @@ class SingleThreadProcessor:
         if last_error is not None:
             raise FatalSyncerError("OpenEvent publish failed after retries") from last_error
         raise FatalSyncerError("OpenEvent publish failed after retries")
-
-    def _log_send_failure(self, task: OutboundTask, result: SendResult, attempts: int) -> None:
-        self._logger.warning(
-            "provider_send_failed request_id=%s channel_id=%s attempts=%s max_attempts=%s error_code=%s error=%s",
-            task.request_id,
-            task.channel_id,
-            attempts,
-            self._retry.provider_send_max_attempts,
-            result.error_code,
-            result.error_message,
-        )
 
 
 def _is_resource_exhausted(error: BaseException) -> bool:

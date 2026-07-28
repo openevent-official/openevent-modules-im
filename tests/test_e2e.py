@@ -258,7 +258,6 @@ def test_p2p_syncer_round_trips_with_mock_im_service(monkeypatch, mock_im_server
         "retry": {
             "publish_max_attempts": 2,
             "publish_retry_delay_ms": 1,
-            "provider_send_max_attempts": 2,
             "idle_sleep_ms": 20,
         },
         "principal_tokens": [

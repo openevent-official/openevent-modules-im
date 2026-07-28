@@ -46,7 +46,6 @@ def test_sample_config_loads():
     assert config.version == "v1"
     assert config.worker.principal == 90001
     assert config.retry.publish_retry_delay_ms == 200
-    assert config.retry.provider_send_retry_delay_ms == 1000
     assert config.providers["lark"].options["timeout_seconds"] == 10
     assert config.providers["lark"].sync.history_retry_delay_ms == 1000
     assert config.providers["lark"].sync.history_overlap_ms == 300000
@@ -302,8 +301,16 @@ def test_rejects_removed_openevent_rpc_timeout():
         parse_config(raw)
 
 
-@pytest.mark.parametrize("field", ["publish_initial_backoff_ms", "publish_max_backoff_ms"])
-def test_rejects_removed_publish_backoff_fields(field):
+@pytest.mark.parametrize(
+    "field",
+    [
+        "provider_send_max_attempts",
+        "provider_send_retry_delay_ms",
+        "publish_initial_backoff_ms",
+        "publish_max_backoff_ms",
+    ],
+)
+def test_rejects_removed_retry_fields(field):
     raw = _valid_raw_config()
     raw["retry"] = {field: 1}
 
@@ -317,15 +324,6 @@ def test_rejects_invalid_lark_timeout(value):
     raw["providers"][0]["options"] = {"timeout_seconds": value}
 
     with pytest.raises(ConfigError, match="timeout_seconds must be a positive number"):
-        parse_config(raw)
-
-
-@pytest.mark.parametrize("value", [-1, 1.5, True])
-def test_rejects_invalid_provider_send_retry_delay(value):
-    raw = _valid_raw_config()
-    raw["retry"] = {"provider_send_retry_delay_ms": value}
-
-    with pytest.raises(ConfigError, match="provider_send_retry_delay_ms"):
         parse_config(raw)
 
 
@@ -392,7 +390,7 @@ def test_rejects_unsupported_provider_name():
         parse_config(raw)
 
 
-def test_mapping_missing_writes_failed_result_and_clears_request():
+def test_mapping_missing_exits_without_writing_result():
     config = load_config("p2p_config.yaml")
     state = RuntimeState()
     task = ParsedMessage(
@@ -425,16 +423,12 @@ def test_mapping_missing_writes_failed_result_and_clears_request():
         logger=logging.getLogger("test"),
     )
 
-    processor.tick()
+    with pytest.raises(FatalSyncerError, match="has no bot mapping"):
+        processor.tick()
 
-    assert "req-missing" not in state.requests_by_id
-    assert "req-missing" in state.completed_request_ids
-    assert im_client.calls[0]["recipients"] == [10003]
-    result = im_client.calls[0]["req"]
-    assert result.status == "FAILED"
-    assert result.error_code == "MAPPING_MISSING"
-    assert result.error_message == "send.request principal has no bot mapping in this P2P channel"
-    assert result.prev_seq == 11
+    assert "req-missing" in state.requests_by_id
+    assert "req-missing" not in state.completed_request_ids
+    assert im_client.calls == []
 
 
 def test_failed_send_result_prevents_history_restore():
@@ -809,7 +803,6 @@ class FailingSendAdapter(FakeAdapter):
             success=False,
             error_code="RATE_LIMIT",
             error_message="provider rate limited",
-            retryable=True,
         )
 
 class RaisingSendAdapter(FakeAdapter):
@@ -1151,7 +1144,7 @@ def test_lark_send_message_does_not_retry_successful_create_response():
 
 
 @pytest.mark.parametrize("code", [99991402, 11020, 11021])
-def test_lark_rate_limit_response_is_retryable(code):
+def test_lark_rate_limit_response_is_failure(code):
     adapter = _fake_lark_adapter(
         FakeLarkMessageClient(
             create_response=FakeLarkResponse(success=False, code=code, msg="rate limited"),
@@ -1167,10 +1160,10 @@ def test_lark_rate_limit_response_is_retryable(code):
     )
 
     assert not result.success
-    assert result.retryable
+    assert result.error_code == str(code)
 
 
-def test_lark_http_5xx_response_is_retryable():
+def test_lark_http_5xx_response_is_failure():
     response = FakeLarkResponse(success=False, code=1, msg="service unavailable")
     response.raw = SimpleNamespace(status_code=503)
     adapter = _fake_lark_adapter(FakeLarkMessageClient(create_response=response))
@@ -1184,10 +1177,9 @@ def test_lark_http_5xx_response_is_retryable():
     )
 
     assert not result.success
-    assert result.retryable
 
 
-def test_lark_business_error_is_not_retryable():
+def test_lark_business_error_is_failure():
     adapter = _fake_lark_adapter(
         FakeLarkMessageClient(
             create_response=FakeLarkResponse(success=False, code=230001, msg="invalid content"),
@@ -1203,10 +1195,9 @@ def test_lark_business_error_is_not_retryable():
     )
 
     assert not result.success
-    assert not result.retryable
 
 
-def test_lark_network_timeout_is_retryable():
+def test_lark_network_timeout_is_failure():
     adapter = _fake_lark_adapter(RaisingLarkMessageClient())
 
     result = adapter.send_message(
@@ -1218,7 +1209,7 @@ def test_lark_network_timeout_is_retryable():
     )
 
     assert not result.success
-    assert result.retryable
+    assert result.error_code == "Timeout"
 
 
 def test_bot_principal_can_send_request():
@@ -1258,7 +1249,7 @@ def test_bot_principal_can_send_request():
     assert im_client.calls[0]["req"].status == "SUCCESS"
 
 
-def test_provider_send_failure_writes_failed_result_after_max_attempts():
+def test_provider_send_failure_exits_immediately_without_result():
     config = load_config("p2p_config.yaml")
     state = RuntimeState()
     state.add_send_request(
@@ -1281,33 +1272,23 @@ def test_provider_send_failure_writes_failed_result_after_max_attempts():
         im_client=im_client,
         mapping=P2PMappingIndex(config),
         adapters={"lark": adapter},
-        retry=RetryConfig(
-            publish_retry_delay_ms=0,
-            provider_send_max_attempts=2,
-            provider_send_retry_delay_ms=0,
-        ),
+        retry=RetryConfig(publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=state,
         logger=logging.getLogger("test"),
     )
 
-    processor.tick()
+    with pytest.raises(FatalSyncerError, match="provider send failed"):
+        processor.tick()
+
+    assert len(adapter.calls) == 1
     assert "req-provider-fail" in state.requests_by_id
+    assert "req-provider-fail" not in state.completed_request_ids
     assert im_client.calls == []
 
-    processor.tick()
 
-    assert len(adapter.calls) == 2
-    assert "req-provider-fail" not in state.requests_by_id
-    assert "req-provider-fail" in state.completed_request_ids
-    result = im_client.calls[0]["req"]
-    assert result.status == "FAILED"
-    assert result.error_code == "PROVIDER_SEND_FAILED"
-    assert "RATE_LIMIT" in result.error_message
-
-
-def test_provider_send_exception_is_not_retried_without_retryable_marker():
+def test_provider_send_exception_exits_immediately():
     config = load_config("p2p_config.yaml")
     state = RuntimeState()
     state.add_send_request(
@@ -1330,49 +1311,20 @@ def test_provider_send_exception_is_not_retried_without_retryable_marker():
         im_client=im_client,
         mapping=P2PMappingIndex(config),
         adapters={"lark": adapter},
-        retry=RetryConfig(
-            publish_retry_delay_ms=0,
-            provider_send_max_attempts=2,
-        ),
+        retry=RetryConfig(publish_retry_delay_ms=0),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,
         state=state,
         logger=logging.getLogger("test"),
     )
 
-    processor.tick()
+    with pytest.raises(FatalSyncerError, match="RuntimeError"):
+        processor.tick()
 
     assert len(adapter.calls) == 1
-    result = im_client.calls[0]["req"]
-    assert result.status == "FAILED"
-    assert result.error_code == "PROVIDER_SEND_FAILED"
-    assert "RuntimeError" in result.error_message
-
-
-def test_provider_retry_waits_for_fixed_delay(monkeypatch):
-    now = {"value": 10.0}
-    monkeypatch.setattr("openevent.im_p2p_syncer.state.time.monotonic", lambda: now["value"])
-    state = RuntimeState()
-    state.add_send_request(
-        ParsedMessage(
-            seq=11,
-            channel_id=10001,
-            principal=90002,
-            recipients=[],
-            kind="send.request",
-            payload={},
-            data={"msg_type": "text", "content": {"text": "hello"}},
-            event_ms=1,
-            request_id="req-delayed-retry",
-        )
-    )
-    task = state.next_pending_task()
-
-    state.retry_send_request(task, delay_ms=1000)
-
-    assert state.next_pending_task() is None
-    now["value"] = 11.0
-    assert state.next_pending_task() == task
+    assert "req-provider-exception" in state.requests_by_id
+    assert "req-provider-exception" not in state.completed_request_ids
+    assert im_client.calls == []
 
 
 @pytest.mark.parametrize("status_code", [StatusCode.UNAVAILABLE, StatusCode.DEADLINE_EXCEEDED])
@@ -1385,7 +1337,6 @@ def test_publish_retry_exhaustion_uses_fixed_delay(status_code):
         retry=RetryConfig(
             publish_max_attempts=2,
             publish_retry_delay_ms=250,
-            provider_send_max_attempts=1,
         ),
         worker_principal=config.worker.principal,
         worker_token=config.worker.token,

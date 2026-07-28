@@ -20,8 +20,6 @@ class OpenEventConfig:
 class RetryConfig:
     publish_max_attempts: int = 5
     publish_retry_delay_ms: int = 200
-    provider_send_max_attempts: int = 5
-    provider_send_retry_delay_ms: int = 1000
     idle_sleep_ms: int = 200
 
 
@@ -89,4 +87,3 @@ class SendResult:
     provider_message_id: str | None = None
     error_code: str | None = None
     error_message: str | None = None
-    retryable: bool = False

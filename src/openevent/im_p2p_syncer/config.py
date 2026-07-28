@@ -59,7 +59,12 @@ def parse_config(raw: dict[str, Any]) -> SyncerConfig:
     retry_raw = _obj(raw.get("retry", {}), "retry")
     _reject_removed_fields(
         retry_raw,
-        {"publish_initial_backoff_ms", "publish_max_backoff_ms"},
+        {
+            "provider_send_max_attempts",
+            "provider_send_retry_delay_ms",
+            "publish_initial_backoff_ms",
+            "publish_max_backoff_ms",
+        },
         "retry",
     )
     retry = RetryConfig(
@@ -70,14 +75,6 @@ def parse_config(raw: dict[str, Any]) -> SyncerConfig:
         publish_retry_delay_ms=_non_negative_int(
             retry_raw.get("publish_retry_delay_ms", 200),
             "retry.publish_retry_delay_ms",
-        ),
-        provider_send_max_attempts=_positive_int(
-            retry_raw.get("provider_send_max_attempts", 5),
-            "retry.provider_send_max_attempts",
-        ),
-        provider_send_retry_delay_ms=_non_negative_int(
-            retry_raw.get("provider_send_retry_delay_ms", 1000),
-            "retry.provider_send_retry_delay_ms",
         ),
         idle_sleep_ms=_non_negative_int(retry_raw.get("idle_sleep_ms", 200), "retry.idle_sleep_ms"),
     )

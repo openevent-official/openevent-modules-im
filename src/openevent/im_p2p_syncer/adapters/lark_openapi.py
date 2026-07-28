@@ -120,7 +120,6 @@ class LarkOpenAPIAdapter:
                 success=False,
                 error_code=type(exc).__name__,
                 error_message=str(exc),
-                retryable=isinstance(exc, (RequestsConnectionError, RequestsTimeout)),
             )
 
         _log_lark_response(
@@ -134,7 +133,6 @@ class LarkOpenAPIAdapter:
                 success=False,
                 error_code=str(getattr(response, "code", "")),
                 error_message=str(getattr(response, "msg", "")),
-                retryable=_is_retryable_lark_response(response),
             )
         message_id = getattr(getattr(response, "data", None), "message_id", None)
         if not message_id:

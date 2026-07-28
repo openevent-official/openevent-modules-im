@@ -50,22 +50,27 @@ constraints:
 | Processed channel | `protocol == "im.v1"`, `description.session_type == "p2p"`, present in mappings, private, and containing the user, bot, and sync worker principals |
 | `send.request` | Consumed only; target session is determined by `channel_id -> (provider, session_id)`; the sender principal must match a mapping in the channel |
 | `sync.record` | Published by the worker; OpenEvent `principal` is the mapped sender principal; `recipients` is the P2P peer principal |
-| `send.result` | Published by the worker; OpenEvent `principal` is the worker principal; `recipients` is the original `send.request` principal |
+| `send.result` | Published only after a successful provider send; OpenEvent `principal` is the worker principal and `recipients` is the original `send.request` principal |
 | channel ACL | The channel must be private and include both P2P principals and the sync worker principal; ACL is the permission boundary, `recipients` is not |
 
-Provider send failures do not require business callers to resubmit. Only explicit
-rate limits, HTTP 5xx responses, connection failures, and timeouts are retried at
-the fixed `retry.provider_send_retry_delay_ms` interval, up to
-`retry.provider_send_max_attempts`. After the retry limit, the worker
-writes `send.result(status=FAILED, error_code=PROVIDER_SEND_FAILED)` and clears
-the request. If `send.request.principal` is missing from mappings in the
-channel, the worker writes `send.result(status=FAILED, error_code=MAPPING_MISSING)`
-and terminates the request.
+Provider send failures do not require business callers to resubmit. Any failed
+Provider response, send exception, missing provider message ID, or sender-mapping
+failure immediately exits the worker without writing `send.result`. The original
+stable `send.request` remains unfinished and is recovered after repair and
+restart. The worker writes `send.result` only for success.
 
-Retryable failures block that P2P channel until success or final failure; other
-channels remain runnable. Invalid credentials, missing permissions, bad arguments,
-unavailable target sessions, and malformed success responses are not retried and
-produce a final failure immediately. Business callers must observe `send.result`.
+A send failure exits the worker and therefore pauses all of its configured
+channels. Operators must repair the cause before restart and configure
+process-manager backoff to avoid a rapid restart loop.
+
+This fail-stop policy has no OpenEvent failure terminal: operators must use the
+process exit and logs to diagnose the cause. A deterministic bad request is
+retried after every restart until its configuration or payload is repaired;
+there is no dead-letter or manual-skip mechanism in this worker.
+
+If the Provider accepts a send but its response is lost, recovery reuses the
+same request-derived Provider UUID. Avoiding duplicate delivery therefore
+depends on the Provider honoring that idempotency key.
 
 ## 3. Mapping Model
 
@@ -154,13 +159,14 @@ im-p2p-syncer --config /etc/openevent/im-sync-worker.yaml
 
 The process stops the Lark WebSocket and attempts graceful shutdown on `SIGINT` or `SIGTERM`. Business callers
 write `send.request` to OpenEvent; the worker consumes requests in P2P channels
-and writes `send.result`. Provider real message callbacks are synchronized as
+and writes `send.result` after successful delivery. Provider real message callbacks are synchronized as
 ordinary `sync.record` and do not trigger another provider send.
 
-If an unfinished `send.request` exists in a P2P channel, the worker processes or
-terminates it before advancing later provider sync for that channel. Business
-callers should observe `send.result` and should not write another
-`send.request` for the same business send action.
+If an unfinished `send.request` exists in a P2P channel, the worker must deliver
+it before advancing later provider sync for that channel. A fatal failure leaves
+it unfinished for recovery after restart. Business callers should observe the
+successful `send.result` and must not write another `send.request` for the same
+business send action.
 
 ## 5. Feishu/Lark Support
 
@@ -209,9 +215,8 @@ Feishu/Lark constraints:
   `sync.record`; neither path filters by sender direction.
 - A successful `message.create` carrying `message_id` is accepted directly; the
   worker does not issue an additional `message.get` confirmation request.
-- Only explicit rate limits, HTTP 5xx responses, connection failures, and timeouts
-  are retried. Credential, permission, argument, target-session, and response-shape
-  errors produce a final failure immediately.
+- Any failed `message.create` response or exception leaves the request unfinished
+  and terminates the worker immediately.
 
 The provider message puller wraps the `im.message.receive_v1` subscription and
 `message.list` handoff into one acknowledged message stream. The SDK callback
@@ -255,7 +260,7 @@ OpenEvent `seq` is the order in which records are durably written, not provider
 event time. An older message returned by the history API may be written at a
 larger `seq`; consumers must use `timestamps.event_ms` for message business time.
 
-## 6. Reliability and Failure Results
+## 6. Reliability and Fail-Stop Behavior
 
 | Scenario | Strategy |
 | --- | --- |
@@ -268,8 +273,8 @@ larger `seq`; consumers must use `timestamps.event_ms` for message business time
 | Real-time event queue full or callback failure | Fail the callback and terminate the worker; the message puller repeats connection handoff after process restart |
 | Explicit temporary history-query failure inside the message puller | Preserve that session's query window and page token and retry after `history_retry_delay_ms`; do not introduce a global repair phase or block other channels |
 | Permanent, malformed, or unclassified history-query failure inside the message puller | Do not acknowledge related messages; exit the worker |
-| `send.request.principal` missing from mapping | Write `send.result(status=FAILED, error_code=MAPPING_MISSING)` and terminate request |
-| Provider send failure | Retry temporary failures at a fixed interval; for non-temporary failures, immediately write `send.result(status=FAILED, error_code=PROVIDER_SEND_FAILED)` and terminate the request |
+| `send.request.principal` missing from mapping | Leave the request unfinished and exit the worker without writing `send.result` |
+| Provider send failure | Leave the request unfinished and exit immediately without writing `send.result` |
 | OpenEvent publish is proven not committed and the underlying status is `UNAVAILABLE` or `DEADLINE_EXCEEDED` | Retry at the fixed `retry.publish_retry_delay_ms` interval; exit after `retry.publish_max_attempts` |
 | OpenEvent publish outcome remains unknown after reconciliation | Do not republish; exit immediately to avoid a duplicate |
 | OpenEvent rejects full `sync.record` as too large | Rewrite and publish degraded `sync.record` with lightweight metadata and `message_too_large` fields |
@@ -346,8 +351,6 @@ mappings:
 | `openevent.target` | yes | public OpenEvent gRPC endpoint |
 | `retry.publish_max_attempts` | no | OpenEvent write retry limit, default `5` |
 | `retry.publish_retry_delay_ms` | no | fixed retry delay when a publish is proven not committed and its underlying status is `UNAVAILABLE` or `DEADLINE_EXCEEDED`, default `200`, non-negative |
-| `retry.provider_send_max_attempts` | no | provider send retry limit per request, default `5` |
-| `retry.provider_send_retry_delay_ms` | no | fixed delay between temporary provider send failures, default `1000`, non-negative |
 | `retry.idle_sleep_ms` | no | main-loop idle sleep, default `200` |
 | `logging.*` | no | basic logging configuration |
 | `principal_tokens[]` | yes | user/bot OpenEvent principal tokens; excludes `worker.principal` |
@@ -375,19 +378,27 @@ Important log fields:
 - `provider`
 - `session_id`
 - `channel_id`
-- `request_id`
 - `provider_message_id`
+- `request_id`
 - `principal`
-- `seq`
+- `openevent_seq`
+- `kind`
+- `error_code`
 
-Deployment checklist:
+## 9. Deployment Checklist
 
-- OpenEvent is reachable.
-- Every configured principal has a valid token.
-- Every mapping references an existing `im.v1` P2P channel.
-- Every mapped channel is private and contains the user, bot, and sync worker principals.
-- Every Feishu/Lark bot mapping uses its provider `credentials.app_id` as `external_user_id`.
-- Provider credentials have permissions to read and send direct messages.
-- The app subscribes to `im.message.receive_v1`, and history-read permissions cover connection handoff.
-- The process manager restarts the worker after a permanent WebSocket failure.
-- Runtime logs and process manager restarts are configured.
+1. `worker.principal` and `worker.token` are set.
+2. `principal_tokens[].principal` has no duplicates, and each `channel_id` has no duplicate `(provider, identity_type, external_user_id)` mapping.
+3. Each `(provider, session_id)` maps to only one `channel_id`.
+4. Each `channel_id` maps to only one `(provider, session_id)`.
+5. Every channel has `protocol == im.v1`.
+6. Every channel has `description.session_type == p2p`.
+7. Description `provider/session_id` values match the mapping.
+8. Every P2P channel resolves to two distinct participant principals, one user and one bot.
+9. Every channel is private and contains the user, bot, and sync worker principals.
+10. Every Feishu/Lark bot mapping uses its Provider `credentials.app_id` as `external_user_id`.
+11. Every participant principal referenced by a mapping has a token.
+12. The sync worker principal can read and write the channel.
+13. The Lark app subscribes to `im.message.receive_v1`, and history-read permissions cover connection handoff.
+14. The process manager restarts the worker after a permanent WebSocket or fatal send failure.
+15. Restart backoff and alerts are configured so a permanent bad request or configuration error does not cause a rapid restart loop.
